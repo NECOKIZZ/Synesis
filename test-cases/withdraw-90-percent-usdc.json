@@ -1,0 +1,18 @@
+{
+  "description": "Agent has 20 USDC, 3 EURC, 0 cirBTC. Instruction: withdraw 90 percent of my usdc.",
+  "context": {
+    "limits": {
+      "max_per_transaction_usdc": 50,
+      "max_daily_usdc": 100,
+      "max_monthly_usdc": 500
+    },
+    "agentBalanceUsdc": 20,
+    "activePolicies": [],
+    "allBalances": {
+      "USDC": 20,
+      "EURC": 3,
+      "cirBTC": 0
+    }
+  },
+  "instruction": "withdraw 90 percent of my usdc"
+}

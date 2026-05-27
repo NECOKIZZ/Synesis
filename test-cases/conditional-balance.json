@@ -1,0 +1,17 @@
+{
+  "instruction": "withdraw everything when my balance hits 200",
+  "context": {
+    "limits": {
+      "max_per_transaction_usdc": 500,
+      "max_daily_usdc": 1000,
+      "max_weekly_usdc": 5000,
+      "max_monthly_usdc": 20000
+    },
+    "agentBalanceUsdc": "150.00",
+    "activePolicies": [],
+    "allBalances": [
+      { "symbol": "USDC", "amount": "150.00", "approxUsdValue": 150 }
+    ],
+    "livePrices": { "eurcUsdc": 1.08, "cirBtcUsdc": 100000 }
+  }
+}

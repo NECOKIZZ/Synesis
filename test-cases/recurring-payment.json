@@ -1,0 +1,24 @@
+{
+  "instruction": "pay sara 5 USDC every week",
+  "context": {
+    "limits": {
+      "max_per_transaction_usdc": 100,
+      "max_daily_usdc": 500,
+      "max_weekly_usdc": 2000,
+      "max_monthly_usdc": 5000
+    },
+    "agentBalanceUsdc": "120.00",
+    "activePolicies": [
+      {
+        "id": "policy-001",
+        "summary": "Send 3 USDC to bob.arc daily",
+        "category": "recurring",
+        "mode": "repeat"
+      }
+    ],
+    "allBalances": [
+      { "symbol": "USDC", "amount": "120.00", "approxUsdValue": 120 }
+    ],
+    "livePrices": { "eurcUsdc": 1.08, "cirBtcUsdc": 100000 }
+  }
+}

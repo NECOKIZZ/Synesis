@@ -1,0 +1,19 @@
+{
+  "instruction": "send cryptolympus 5 eurc",
+  "context": {
+    "limits": {
+      "max_per_transaction_usdc": 100,
+      "max_daily_usdc": 500,
+      "max_weekly_usdc": 2000,
+      "max_monthly_usdc": 5000
+    },
+    "agentBalanceUsdc": "20.00",
+    "activePolicies": [],
+    "allBalances": [
+      { "symbol": "USDC", "amount": "20.00", "approxUsdValue": 20 },
+      { "symbol": "EURC", "amount": "3.00", "approxUsdValue": 3.24 },
+      { "symbol": "cirBTC", "amount": "0.00", "approxUsdValue": 0 }
+    ],
+    "livePrices": { "eurcUsdc": 1.08, "cirBtcUsdc": 100000 }
+  }
+}

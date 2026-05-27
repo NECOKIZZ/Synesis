@@ -1,0 +1,19 @@
+{
+  "instruction": "swap all my eurc to usdc and send half the amount to cryptolympus on friday...the remaining half, withdraw into my wallet instantly",
+  "context": {
+    "limits": {
+      "max_per_transaction_usdc": 100,
+      "max_daily_usdc": 500,
+      "max_weekly_usdc": 2000,
+      "max_monthly_usdc": 5000
+    },
+    "agentBalanceUsdc": "0.00",
+    "activePolicies": [],
+    "allBalances": [
+      { "symbol": "USDC", "amount": "0.00", "approxUsdValue": 0 },
+      { "symbol": "EURC", "amount": "7.00", "approxUsdValue": 7.56 },
+      { "symbol": "cirBTC", "amount": "0.00", "approxUsdValue": 0 }
+    ],
+    "livePrices": { "eurcUsdc": 1.08, "cirBtcUsdc": 100000 }
+  }
+}

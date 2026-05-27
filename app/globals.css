@@ -1,0 +1,173 @@
+@import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@400;500;600;700&family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap');
+@import url('https://api.fontshare.com/v2/css?f[]=clash-display@200,300,400,500,600,700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Force dark theme ── */
+:root {
+  --background: #070910;
+  --foreground: #fafafa;
+  --gold: #c9a96e;
+  --usdc-blue: #2775CA;
+  --hero-bg: #070910;
+  --font-geist-sans: 'Geist', system-ui, sans-serif;
+}
+
+html,
+body {
+  font-family: 'Geist', system-ui, sans-serif;
+  background: var(--background);
+  color: var(--foreground);
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  height: 100%;
+}
+
+/* Wallet page overrides — allow scroll. Background painted by the
+   wallet component itself so non-authenticated states can pick their
+   own theme. */
+.wallet-page {
+  overflow-y: auto;
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+/* Hide scrollbars for elements that scroll horizontally on mobile but
+   shouldn't show a track (e.g. action button rows). */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+/* Clash Display uppercase utility */
+.font-clash {
+  font-family: 'Clash Display', system-ui, sans-serif;
+}
+
+/* Geist body text utility */
+.font-geist {
+  font-family: 'Geist', system-ui, sans-serif;
+}
+
+/* ── Keyframes ── */
+
+/* Coin Y-axis 3D rotation */
+@keyframes spin-coin {
+  0% {
+    transform: rotateY(0deg);
+  }
+  100% {
+    transform: rotateY(360deg);
+  }
+}
+
+/* Pulsing glow around coin */
+@keyframes pulse-glow {
+  0%, 100% {
+    opacity: 0.6;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.08);
+  }
+}
+
+/* Subtle float bob */
+@keyframes float {
+  0%, 100% {
+    transform: translateY(0px);
+  }
+  50% {
+    transform: translateY(-12px);
+  }
+}
+
+/* Robot hand slides from left */
+@keyframes slide-in-left {
+  0% {
+    transform: translateX(-120%);
+    opacity: 0;
+  }
+  60% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+/* Human hand slides from right */
+@keyframes slide-in-right {
+  0% {
+    transform: translateX(120%);
+    opacity: 0;
+  }
+  60% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+/* Particle twinkle */
+@keyframes twinkle {
+  0%, 100% {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* Radial glow behind coin */
+@keyframes breathe-glow {
+  0%, 100% {
+    opacity: 0.3;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  50% {
+    opacity: 0.55;
+    transform: translate(-50%, -50%) scale(1.15);
+  }
+}
+
+/* Word carousel: fade in from bottom, hold, fade out to top */
+@keyframes word-fade-up {
+  0% {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  15% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  70% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  85% {
+    opacity: 0;
+    transform: translateY(-12px);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-12px);
+  }
+}
+
+/* CTA button shimmer */
+@keyframes shimmer {
+  0% {
+    background-position: -200% center;
+  }
+  100% {
+    background-position: 200% center;
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "instruction": "swap 50 USDC to cirBTC then send it to maya",
+  "context": {
+    "limits": {
+      "max_per_transaction_usdc": 200,
+      "max_daily_usdc": 1000,
+      "max_weekly_usdc": 5000,
+      "max_monthly_usdc": 20000
+    },
+    "agentBalanceUsdc": "500.00",
+    "activePolicies": [],
+    "allBalances": [
+      { "symbol": "USDC", "amount": "500.00", "approxUsdValue": 500 },
+      { "symbol": "cirBTC", "amount": "0.00", "approxUsdValue": 0 }
+    ],
+    "livePrices": { "eurcUsdc": 1.08, "cirBtcUsdc": 100000 }
+  }
+}
