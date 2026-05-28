@@ -3,10 +3,14 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import Image from "next/image";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import HeroCoin from "./HeroCoin";
 import HeroHands from "./HeroHands";
 
 export default function HeroSection() {
+  const router = useRouter();
+  const [navigating, setNavigating] = useState<string | null>(null);
+
   // Warm the auth/session check on hover so the click-to-wallet feels
   // instant. Side-effect-free GET to /api/circle/me; we discard the body.
   // Browser-cached as `same-origin` and only fired once per session.
@@ -62,6 +66,11 @@ export default function HeroSection() {
         overflow: "hidden",
       }}
     >
+      {/* Global keyframes for loading spinner */}
+      <style dangerouslySetInnerHTML={{ __html: `
+        @keyframes spin { to { transform: rotate(360deg); } }
+      `}} />
+
       {/* ── OAuth error toast ── */}
       {oauthError && (
         <div
@@ -139,23 +148,38 @@ export default function HeroSection() {
         border: "1px solid rgba(255,255,255,0.35)",
         boxShadow: "0 8px 32px rgba(0,0,0,0.08), inset 0 1px 0 rgba(255,255,255,0.4)",
       }}>
-        <Link href="/wallet" prefetch style={{
-          padding: "8px 14px",
-          borderRadius: "50px",
-          color: "#1a1a1a",
-          fontFamily: "'Clash Display', sans-serif",
-          fontSize: "14px",
-          fontWeight: 500,
-          textDecoration: "none",
-          transition: "all 0.3s ease",
-        }} onMouseEnter={(e) => {
-          e.currentTarget.style.background = "rgba(255,255,255,0.5)";
-          warmSession();
-        }} onFocus={warmSession} onTouchStart={warmSession} onMouseLeave={(e) => {
-          e.currentTarget.style.background = "transparent";
-        }}>
-          Wallet
-        </Link>
+        <button
+          disabled={!!navigating}
+          onClick={() => {
+            setNavigating("wallet");
+            router.push("/wallet");
+          }}
+          style={{
+            padding: "8px 14px",
+            borderRadius: "50px",
+            color: navigating === "wallet" ? "rgba(26,26,26,0.5)" : "#1a1a1a",
+            fontFamily: "'Clash Display', sans-serif",
+            fontSize: "14px",
+            fontWeight: 500,
+            textDecoration: "none",
+            transition: "all 0.3s ease",
+            background: "transparent",
+            border: "none",
+            cursor: navigating === "wallet" ? "wait" : "pointer",
+          }}
+          onMouseEnter={(e) => {
+            if (navigating) return;
+            e.currentTarget.style.background = "rgba(255,255,255,0.5)";
+            warmSession();
+          }}
+          onFocus={warmSession}
+          onTouchStart={warmSession}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = "transparent";
+          }}
+        >
+          {navigating === "wallet" ? "Opening…" : "Wallet"}
+        </button>
         <Link href="/agent" style={{
           padding: "8px 14px",
           borderRadius: "50px",
@@ -356,21 +380,24 @@ export default function HeroSection() {
         right: "40px",
         zIndex: 50,
       }}>
-        <Link
-          href="/wallet"
+        <button
           id="hero-cta"
-          prefetch
+          disabled={!!navigating}
           onFocus={warmSession}
           onTouchStart={warmSession}
+          onClick={() => {
+            setNavigating("wallet");
+            router.push("/wallet");
+          }}
           style={{
             display: "inline-flex",
             alignItems: "center",
             gap: "10px",
             padding: "14px 32px",
-            background: "#1a1a1a",
+            background: navigating === "wallet" ? "#3a3a3a" : "#1a1a1a",
             border: "1px solid rgba(255,255,255,0.15)",
             borderRadius: "50px",
-            color: "#ffffff",
+            color: navigating === "wallet" ? "rgba(255,255,255,0.6)" : "#ffffff",
             fontFamily: "'Clash Display', sans-serif",
             fontSize: "14px",
             fontWeight: 600,
@@ -379,10 +406,12 @@ export default function HeroSection() {
             textDecoration: "none",
             backdropFilter: "blur(10px)",
             transition: "all 0.4s cubic-bezier(0.16, 1, 0.3, 1)",
-            cursor: "pointer",
+            cursor: navigating === "wallet" ? "wait" : "pointer",
             boxShadow: "0 0 20px rgba(201,169,110,0.1), inset 0 0 20px rgba(201,169,110,0.05)",
+            opacity: navigating === "wallet" ? 0.7 : 1,
           }}
           onMouseEnter={(e) => {
+            if (navigating) return;
             warmSession();
             const el = e.currentTarget;
             el.style.background = "#2a2a2a";
@@ -392,17 +421,26 @@ export default function HeroSection() {
           }}
           onMouseLeave={(e) => {
             const el = e.currentTarget;
-            el.style.background = "#1a1a1a";
+            el.style.background = navigating === "wallet" ? "#3a3a3a" : "#1a1a1a";
             el.style.borderColor = "rgba(255,255,255,0.15)";
             el.style.boxShadow = "0 0 20px rgba(0,0,0,0.2), inset 0 0 20px rgba(255,255,255,0.05)";
             el.style.transform = "translateY(0)";
           }}
         >
-          Enter Wallet
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M5 12h14M12 5l7 7-7 7" />
-          </svg>
-        </Link>
+          {navigating === "wallet" ? (
+            <>
+              <span style={{ display: "inline-block", width: 14, height: 14, border: "2px solid rgba(255,255,255,0.3)", borderTopColor: "rgba(255,255,255,0.8)", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+              Opening…
+            </>
+          ) : (
+            <>
+              Enter Wallet
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M5 12h14M12 5l7 7-7 7" />
+              </svg>
+            </>
+          )}
+        </button>
       </div>
 
       {/* ── CTA Button — mobile, below subtext ── */}
@@ -413,36 +451,49 @@ export default function HeroSection() {
         transform: "translateX(-50%)",
         zIndex: 50,
       }}>
-        <Link
-          href="/wallet"
+        <button
           id="hero-cta-mobile"
-          prefetch
+          disabled={!!navigating}
           onTouchStart={warmSession}
           onFocus={warmSession}
+          onClick={() => {
+            setNavigating("wallet");
+            router.push("/wallet");
+          }}
           style={{
             display: "inline-flex",
             alignItems: "center",
             gap: "10px",
             padding: "14px 32px",
-            background: "#1a1a1a",
+            background: navigating === "wallet" ? "#3a3a3a" : "#1a1a1a",
             border: "1px solid rgba(255,255,255,0.15)",
             borderRadius: "50px",
-            color: "#ffffff",
+            color: navigating === "wallet" ? "rgba(255,255,255,0.6)" : "#ffffff",
             fontFamily: "'Clash Display', sans-serif",
             fontSize: "14px",
             fontWeight: 600,
             letterSpacing: "2px",
             textTransform: "uppercase",
             textDecoration: "none",
-            cursor: "pointer",
+            cursor: navigating === "wallet" ? "wait" : "pointer",
             boxShadow: "0 0 20px rgba(0,0,0,0.2)",
+            opacity: navigating === "wallet" ? 0.7 : 1,
           }}
         >
-          Enter Wallet
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M5 12h14M12 5l7 7-7 7" />
-          </svg>
-        </Link>
+          {navigating === "wallet" ? (
+            <>
+              <span style={{ display: "inline-block", width: 14, height: 14, border: "2px solid rgba(255,255,255,0.3)", borderTopColor: "rgba(255,255,255,0.8)", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+              Opening…
+            </>
+          ) : (
+            <>
+              Enter Wallet
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M5 12h14M12 5l7 7-7 7" />
+              </svg>
+            </>
+          )}
+        </button>
       </div>
     </section>
   );

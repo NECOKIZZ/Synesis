@@ -66,6 +66,7 @@ export interface TokenBalance {
   address: string;
   amount: string;
   decimals: number;
+  usdValue: number; // approximate USD value for this token balance
 }
 
 export interface WalletShellProps {
@@ -75,6 +76,7 @@ export interface WalletShellProps {
   balanceUsdc: string;          // formatted decimal, e.g. "12.34"
   balanceLoading: boolean;
   tokenBalances: TokenBalance[];
+  totalUsdValue: number;        // total USD across all tokens
   agentActivated: boolean | null;
   activity: ActivityRow[];
   onSend: () => void;
@@ -96,6 +98,7 @@ export function WalletShell(props: WalletShellProps) {
     balanceUsdc,
     balanceLoading,
     tokenBalances,
+    totalUsdValue,
     agentActivated,
     activity,
     onSend,
@@ -118,14 +121,14 @@ export function WalletShell(props: WalletShellProps) {
     return base.charAt(0).toUpperCase() + base.slice(1);
   }, [arcName, email]);
 
-  // Hero balance — split into integer + fraction for typographic alignment
+  // Hero balance — total USD across all tokens, split into integer + fraction
   const [intPart, fracPart] = useMemo(() => {
-    const n = Number(balanceUsdc);
+    const n = totalUsdValue;
     if (!isFinite(n)) return ["00", "000"];
     const fixed = n.toFixed(3);
     const [i, f] = fixed.split(".");
     return [i.padStart(2, "0"), f];
-  }, [balanceUsdc]);
+  }, [totalUsdValue]);
 
   // Build the QR data URL for the hero card tile. Encodes wallet address.
   useEffect(() => {
@@ -153,6 +156,13 @@ export function WalletShell(props: WalletShellProps) {
           "radial-gradient(ellipse 90% 60% at 50% 115%, rgba(90, 150, 240, 0.42) 0%, rgba(90, 150, 240, 0.18) 35%, rgba(90, 150, 240, 0) 65%)",
       }}
     >
+      {/* Shimmer animation keyframes — injected once for all skeletons */}
+      <style dangerouslySetInnerHTML={{ __html: `
+        @keyframes shimmer-slide {
+          0% { background-position: 200% 0; }
+          100% { background-position: -200% 0; }
+        }
+      `}} />
       {/* Layout grid: sidebar + main on md+, single column on mobile */}
       <div className="mx-auto flex w-full max-w-[1400px] flex-col gap-4 p-3 sm:p-5 md:flex-row md:gap-6 md:p-6 lg:p-8">
 
@@ -189,25 +199,36 @@ export function WalletShell(props: WalletShellProps) {
             </button>
           </div>
 
-          {tab === "home" && (
-            <HomeTab
-              displayName={displayName}
-              arcName={arcName}
-              intPart={intPart}
-              fracPart={fracPart}
-              balanceLoading={balanceLoading}
-              tokenBalances={tokenBalances}
-              qrDataUrl={qrDataUrl}
-              onReceive={onReceive}
-              onSend={onSend}
-              onRequest={onRequest}
-              onCopyAddress={onCopyAddress}
-              copiedAddress={copiedAddress}
-            />
+          {balanceLoading ? (
+            <>
+              {tab === "home" && <HomeShimmer />}
+              {tab === "activity" && <ActivityShimmer />}
+              {tab === "agent" && <AgentShimmer />}
+              {tab === "policies" && <PoliciesShimmer />}
+            </>
+          ) : (
+            <>
+              {tab === "home" && (
+                <HomeTab
+                  displayName={displayName}
+                  arcName={arcName}
+                  intPart={intPart}
+                  fracPart={fracPart}
+                  balanceLoading={balanceLoading}
+                  tokenBalances={tokenBalances}
+                  qrDataUrl={qrDataUrl}
+                  onReceive={onReceive}
+                  onSend={onSend}
+                  onRequest={onRequest}
+                  onCopyAddress={onCopyAddress}
+                  copiedAddress={copiedAddress}
+                />
+              )}
+              {tab === "activity" && <ActivityTab activity={activity} />}
+              <div className={tab !== "agent" ? "hidden" : ""}><AgentTab arcName={arcName} /></div>
+              <div className={tab !== "policies" ? "hidden" : ""}><PoliciesTab /></div>
+            </>
           )}
-          {tab === "activity" && <ActivityTab activity={activity} />}
-          <div className={tab !== "agent" ? "hidden" : ""}><AgentTab arcName={arcName} /></div>
-          <div className={tab !== "policies" ? "hidden" : ""}><PoliciesTab /></div>
         </main>
       </div>
 
@@ -505,7 +526,7 @@ function HomeTab(props: {
                     className="font-clash text-xl font-semibold text-white sm:text-2xl md:text-3xl"
                     style={{ fontFamily: "'Clash Display', sans-serif" }}
                   >
-                    USDC
+                    USD
                   </span>
                 </>
               )}
@@ -1778,4 +1799,151 @@ function formatRelative(iso: string): string {
   const day = Math.floor(hr / 24);
   if (day < 7) return `${day}d ago`;
   return new Date(iso).toLocaleDateString();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Shimmer loading skeletons — match the layout of each tab so users
+// can anticipate content before it arrives.
+// ═══════════════════════════════════════════════════════════════════
+
+function ShimmerBlock({ className = "" }: { className?: string }) {
+  return (
+    <div
+      className={`bg-gradient-to-r from-white/[0.06] via-white/[0.14] to-white/[0.06] ${className}`}
+      style={{
+        backgroundSize: "200% 100%",
+        animation: "shimmer-slide 1.4s infinite linear",
+      }}
+    />
+  );
+}
+
+function HomeShimmer() {
+  return (
+    <>
+      {/* Hero card skeleton */}
+      <section className="relative overflow-hidden rounded-3xl" style={{ backgroundColor: "#0a0a0a" }}>
+        <div className="relative flex flex-col gap-5 p-5 sm:p-7 md:flex-row md:items-start md:justify-between md:gap-8 md:p-9">
+          <div className="min-w-0 flex-1 space-y-4">
+            <ShimmerBlock className="h-5 w-32 rounded-md" />
+            <ShimmerBlock className="h-14 w-48 rounded-xl sm:h-16 sm:w-56 md:h-20 md:w-72" />
+          </div>
+          <ShimmerBlock className="h-24 w-24 shrink-0 self-end rounded-2xl sm:h-28 sm:w-28 md:h-32 md:w-32 md:self-start" />
+        </div>
+      </section>
+
+      {/* Action buttons skeleton */}
+      <section className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <ShimmerBlock className="h-20 rounded-2xl" />
+        <ShimmerBlock className="h-20 rounded-2xl" />
+        <ShimmerBlock className="h-20 rounded-2xl" />
+        <ShimmerBlock className="h-20 rounded-2xl" />
+      </section>
+
+      {/* Assets skeleton */}
+      <section className="rounded-3xl bg-[#0d2147] p-5 sm:p-6">
+        <div className="mb-4 flex items-baseline justify-between">
+          <ShimmerBlock className="h-7 w-24 rounded-md" />
+          <ShimmerBlock className="h-4 w-20 rounded-md" />
+        </div>
+        <div className="flex flex-col gap-2">
+          <ShimmerBlock className="h-14 rounded-2xl" />
+          <ShimmerBlock className="h-14 rounded-2xl" />
+          <ShimmerBlock className="h-14 rounded-2xl" />
+        </div>
+      </section>
+    </>
+  );
+}
+
+function ActivityShimmer() {
+  return (
+    <section className="rounded-3xl bg-[#0d2147] p-5 sm:p-7">
+      <div className="mb-5 flex items-baseline justify-between">
+        <ShimmerBlock className="h-8 w-32 rounded-md" />
+        <ShimmerBlock className="h-4 w-16 rounded-md" />
+      </div>
+      <div className="flex flex-col gap-2">
+        {Array.from({ length: 5 }).map((_, i) => (
+          <div key={i} className="flex items-center gap-3 rounded-2xl border border-white/8 bg-white/5 px-4 py-3.5">
+            <ShimmerBlock className="h-8 w-8 shrink-0 rounded-full" />
+            <div className="min-w-0 flex-1 space-y-2">
+              <div className="flex items-center gap-2">
+                <ShimmerBlock className="h-4 w-16 rounded-md" />
+                <ShimmerBlock className="h-4 w-20 rounded-md" />
+              </div>
+              <ShimmerBlock className="h-3 w-24 rounded-md" />
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function AgentShimmer() {
+  return (
+    <section className="flex h-[calc(100vh-180px)] flex-col rounded-3xl bg-[#0d2147] p-5 sm:p-7">
+      {/* Chat area */}
+      <div className="mb-4 flex-1 space-y-4 overflow-hidden">
+        {/* Agent message */}
+        <div className="flex items-start gap-3">
+          <ShimmerBlock className="h-8 w-8 rounded-full" />
+          <ShimmerBlock className="h-16 w-[70%] rounded-2xl rounded-tl-none" />
+        </div>
+        {/* User message */}
+        <div className="flex items-start justify-end gap-3">
+          <ShimmerBlock className="h-12 w-[55%] rounded-2xl rounded-tr-none" />
+          <ShimmerBlock className="h-8 w-8 rounded-full" />
+        </div>
+        {/* Agent message */}
+        <div className="flex items-start gap-3">
+          <ShimmerBlock className="h-8 w-8 rounded-full" />
+          <ShimmerBlock className="h-20 w-[65%] rounded-2xl rounded-tl-none" />
+        </div>
+      </div>
+      {/* Input area */}
+      <div className="mt-auto flex items-center gap-3">
+        <ShimmerBlock className="h-12 flex-1 rounded-2xl" />
+        <ShimmerBlock className="h-12 w-12 rounded-2xl" />
+      </div>
+    </section>
+  );
+}
+
+function PoliciesShimmer() {
+  return (
+    <section className="space-y-5">
+      {/* Header */}
+      <div className="rounded-3xl bg-[#0d2147] p-5 sm:p-7">
+        <div className="mb-5 flex items-baseline justify-between">
+          <ShimmerBlock className="h-8 w-40 rounded-md" />
+          <ShimmerBlock className="h-4 w-16 rounded-md" />
+        </div>
+        <div className="space-y-3">
+          <ShimmerBlock className="h-14 rounded-2xl" />
+          <ShimmerBlock className="h-14 rounded-2xl" />
+        </div>
+      </div>
+      {/* Policy cards */}
+      <div className="space-y-3">
+        {Array.from({ length: 3 }).map((_, i) => (
+          <div key={i} className="rounded-2xl border border-white/10 bg-white/5 p-4 space-y-3">
+            <div className="flex items-start justify-between gap-2">
+              <div className="flex gap-1.5">
+                <ShimmerBlock className="h-5 w-16 rounded-full" />
+                <ShimmerBlock className="h-5 w-20 rounded-full" />
+              </div>
+              <ShimmerBlock className="h-4 w-14 rounded-md" />
+            </div>
+            <ShimmerBlock className="h-4 w-full rounded-md" />
+            <div className="flex items-center justify-between pt-1">
+              <ShimmerBlock className="h-3 w-32 rounded-md" />
+              <ShimmerBlock className="h-6 w-16 rounded-lg" />
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
 }

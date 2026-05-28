@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useCircleWallet } from "../circle-wallet-context";
 import { QrScanner } from "./qr-scanner";
+import { ArcLoader } from "@/app/components/arc-loader";
 
 const ARC_EXPLORER =
   process.env.NEXT_PUBLIC_ARC_EXPLORER_URL || "https://testnet.arcscan.app/tx/";
@@ -272,10 +273,7 @@ export function SendModal({ onClose, onSent }: SendModalProps) {
                 className="mt-1 w-full rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-blue-500 active:scale-[0.98] disabled:opacity-40"
               >
                 {step === "preparing" ? (
-                  <span className="flex items-center justify-center gap-2">
-                    <span className="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-white border-t-transparent" />
-                    Checking…
-                  </span>
+                  <ArcLoader size="inline" label="Checking…" />
                 ) : (
                   "Review"
                 )}
@@ -347,13 +345,11 @@ export function SendModal({ onClose, onSent }: SendModalProps) {
 
           {/* ════════════════════════════════════════ SIGNING STEP */}
           {step === "signing" && (
-            <div className="py-8 text-center">
-              <div className="mx-auto mb-4 h-10 w-10 animate-spin rounded-full border-[3px] border-white/20 border-t-blue-400" />
-              <p className="text-sm font-medium text-white">Waiting for PIN confirmation…</p>
-              <p className="mt-1 text-xs text-white/40">
-                Complete the Circle PIN dialog that just opened.
-              </p>
-            </div>
+            <ArcLoader
+              size="card"
+              label="Waiting for PIN confirmation…"
+              showFacts={false}
+            />
           )}
 
           {/* ════════════════════════════════════════ DONE STEP */}

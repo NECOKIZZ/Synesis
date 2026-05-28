@@ -244,6 +244,7 @@ export default function AgentPage() {
     }
 
     const skillResult: SkillResult = await res.json();
+    console.log("[interpret] skillResult:", JSON.stringify(skillResult, null, 2));
 
     if (skillResult.skill === "UNKNOWN") {
       updateMessage(thinkingId, {
@@ -281,6 +282,7 @@ export default function AgentPage() {
       updateMessage(msgId, {
         skillResult: undefined,
         text: data.error ?? "Action failed",
+        pending: false,
       });
       return;
     }
@@ -310,13 +312,14 @@ export default function AgentPage() {
         await loadStatus();
         break;
       case "CHECK_BALANCE":
+        console.log("[CHECK_BALANCE] data.result:", JSON.stringify(r, null, 2));
         resultText = `Agent balance: ${r.balanceUsdc} USDC`;
         break;
       default:
         resultText = "Done.";
     }
 
-    updateMessage(msgId, { skillResult: undefined, text: resultText });
+    updateMessage(msgId, { skillResult: undefined, text: resultText, pending: false });
   }
 
   async function handleConfirm(pin: string) {

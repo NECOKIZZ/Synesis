@@ -13,6 +13,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { createSupabaseBrowserClient, isSupabaseConfigured } from "@/lib/supabase/client";
+import { ArcLoader } from "@/app/components/arc-loader";
 
 type Mode = "choose" | "email-input" | "code-input" | "google-redirecting";
 
@@ -160,10 +161,7 @@ export function AuthGate({
   if (mode === "google-redirecting") {
     return (
       <Shell>
-        <Spinner />
-        <p className="mt-6 font-clash text-sm uppercase tracking-[0.25em] text-white/80">
-          Redirecting to Google
-        </p>
+        <ArcLoader size="card" label="Redirecting to Google" showFacts={false} />
       </Shell>
     );
   }
@@ -338,16 +336,6 @@ function PrimaryButton({
     >
       {children}
     </button>
-  );
-}
-
-/** Tiny indeterminate spinner for the redirecting state. */
-function Spinner() {
-  return (
-    <div
-      aria-hidden
-      className="h-8 w-8 animate-spin rounded-full border-2 border-white/30 border-t-white"
-    />
   );
 }
 

@@ -141,6 +141,9 @@ export const SwapUsdc: SkillHandler = {
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Swap failed";
       console.error("[swap-usdc] error:", msg);
+      if (msg.includes("Simulation failed") || msg.includes("Transaction reverted")) {
+        return { ok: false, error: "Swap simulation failed: no liquidity for this pair on Arc Testnet, or price impact is too high. Try a smaller amount.", status: 502 };
+      }
       if (msg.includes("SLIPPAGE_EXCEEDED") || msg.toLowerCase().includes("slippage")) {
         return { ok: false, error: "Swap failed: price moved too much. Try again or reduce the amount.", status: 502 };
       }

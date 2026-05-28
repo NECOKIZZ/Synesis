@@ -455,6 +455,15 @@ export async function interpretInstruction(args: {
   const livePrices = args.context.livePrices ?? await getLivePrices();
   const referer = args.referer ?? process.env.NEXT_PUBLIC_APP_URL ?? "https://wallet.dotarc.app";
 
+  const systemPrompt = buildSystemPrompt({ ...args.context, livePrices });
+
+  // Debug: log exact LLM inputs (prompt omitted — too large)
+  console.log("\n=== LLM INPUT ===");
+  console.log("[MODEL]", model);
+  console.log("[INSTRUCTION]", args.instruction);
+  console.log("[CONTEXT]", JSON.stringify({ ...args.context, livePrices }, null, 2));
+  console.log("=================\n");
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 30_000);
 
@@ -471,7 +480,7 @@ export async function interpretInstruction(args: {
       body: JSON.stringify({
         model,
         messages: [
-          { role: "system", content: buildSystemPrompt({ ...args.context, livePrices }) },
+          { role: "system", content: systemPrompt },
           { role: "user", content: args.instruction },
         ],
         response_format: { type: "json_object" },

@@ -7,7 +7,7 @@ import { AuthGate } from "../auth-gate";
 import { SendModal } from "./send-modal";
 import { ReceiveModal } from "./receive-modal";
 import { RequestModal } from "./request-modal";
-import { WalletShell, type ActivityRow, type Tab } from "./wallet-shell";
+import { WalletShell, type ActivityRow, type Tab, type TokenBalance } from "./wallet-shell";
 import WalletLoading from "./loading";
 
 const ARC_EXPLORER = process.env.NEXT_PUBLIC_ARC_EXPLORER_URL || "https://testnet.arcscan.app/tx/";
@@ -21,13 +21,12 @@ const ERC20_ABI = [
   "function decimals() view returns (uint8)",
 ];
 
-export interface TokenBalance {
-  symbol: string;
-  name: string;
-  address: string;
-  amount: string;
-  decimals: number;
-}
+// Approximate USD rates for total balance display (display only, not for math)
+const TOKEN_USD_RATES: Record<string, number> = {
+  USDC: 1.0,
+  EURC: 1.08,
+  cirBTC: 100_000,
+};
 
 export default function WalletPage() {
   const { status, session, error, clearError, startCircleFlow, registerName, logout } = useCircleWallet();
@@ -122,15 +121,18 @@ export default function WalletPage() {
                 contract.balanceOf(session.walletAddress) as Promise<bigint>,
                 contract.decimals() as Promise<bigint>,
               ]);
+              const amount = formatUnits(raw, decimals);
+              const rate = TOKEN_USD_RATES[cfg.symbol] ?? 0;
               results.push({
                 symbol: cfg.symbol,
                 name: cfg.name,
                 address: cfg.address,
-                amount: formatUnits(raw, decimals),
+                amount,
                 decimals: Number(decimals),
+                usdValue: parseFloat(amount) * rate,
               });
               if (cfg.symbol === "USDC" && !cancelled) {
-                setBalance(formatUnits(raw, decimals));
+                setBalance(amount);
               }
             } catch {
               results.push({
@@ -139,6 +141,7 @@ export default function WalletPage() {
                 address: cfg.address,
                 amount: "0",
                 decimals: 6,
+                usdValue: 0,
               });
               if (cfg.symbol === "USDC" && !cancelled) setBalance("0");
             }
@@ -371,6 +374,7 @@ export default function WalletPage() {
   }
 
   const balanceForShell = balance ?? "0";
+  const totalUsdValue = tokenBalances.reduce((sum, t) => sum + (t.usdValue ?? 0), 0);
 
   return (
     <>
@@ -381,6 +385,7 @@ export default function WalletPage() {
         balanceUsdc={balanceForShell}
         balanceLoading={balanceLoading && balance === null}
         tokenBalances={tokenBalances}
+        totalUsdValue={totalUsdValue}
         agentActivated={agentActivated}
         activity={activity}
         onSend={() => setShowSend(true)}

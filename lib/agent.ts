@@ -331,10 +331,22 @@ export async function getAgentAllBalances(agentWalletId: string): Promise<AgentT
       };
     });
 
+  // Circle may return the same token twice (e.g. native + gateway balance).
+  // Deduplicate by symbol, keeping the entry with the highest amount.
+  const deduped = new Map<string, AgentTokenBalance>();
+  for (const t of fromCircle) {
+    const key = t.symbol.toUpperCase();
+    const existing = deduped.get(key);
+    if (!existing || t.amountNumber > existing.amountNumber) {
+      deduped.set(key, t);
+    }
+  }
+  const fromCircleDeduped = Array.from(deduped.values());
+
   // Circle omits tokens with zero balance. Inject them so the model always
   // sees the full portfolio and can apply SMART BALANCE INFERENCE correctly.
   const supportedSymbols = ["USDC", "EURC", "CIRBTC"];
-  const presentSymbols = new Set(fromCircle.map((t) => t.symbol.toUpperCase()));
+  const presentSymbols = new Set(fromCircleDeduped.map((t) => t.symbol.toUpperCase()));
   const zeroBalances: AgentTokenBalance[] = supportedSymbols
     .filter((s) => !presentSymbols.has(s))
     .map((symbol) => ({
@@ -345,7 +357,7 @@ export async function getAgentAllBalances(agentWalletId: string): Promise<AgentT
       approxUsdValue: 0,
     }));
 
-  return [...fromCircle, ...zeroBalances]
+  return [...fromCircleDeduped, ...zeroBalances]
     .sort((a, b) => b.approxUsdValue - a.approxUsdValue);
 }
 
