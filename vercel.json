@@ -1,8 +1,1 @@
-{
-  "crons": [
-    {
-      "path": "/api/cron/agent-policies",
-      "schedule": "0 * * * *"
-    }
-  ]
-}
+{}
