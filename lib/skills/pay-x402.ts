@@ -183,7 +183,7 @@ export const PayX402: SkillHandler = {
           "X-Payment": paymentProof,
         },
       });
-    } catch (err) {
+    } catch {
       return {
         ok: true,
         result: {

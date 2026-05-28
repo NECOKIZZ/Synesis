@@ -41,7 +41,7 @@ export const SwapUsdc: SkillHandler = {
   },
 
   async execute(ctx: SkillContext): Promise<SkillOutput> {
-    const { agentWallet, limits, params, getSpentSince } = ctx;
+    const { agentWallet, params } = ctx;
 
     const tokenIn  = String(params.tokenIn  ?? "").toUpperCase().trim();
     const tokenOut = String(params.tokenOut ?? "").toUpperCase().trim();

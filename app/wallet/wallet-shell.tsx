@@ -19,7 +19,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import QRCode from "qrcode";
 import { useCircleWallet } from "@/app/circle-wallet-context";
-import type { AnyTaskResult, PlanStep } from "@/lib/agent-types";
+import type { AnyTaskResult } from "@/lib/agent-types";
 import {
   Home as HomeIcon,
   Activity as ActivityIcon,
@@ -95,17 +95,14 @@ export function WalletShell(props: WalletShellProps) {
     arcName,
     email,
     walletAddress,
-    balanceUsdc,
     balanceLoading,
     tokenBalances,
     totalUsdValue,
-    agentActivated,
     activity,
     onSend,
     onReceive,
     onRequest,
     onCopyAddress,
-    onActivateAgent,
     onLogout,
     copiedAddress,
     activeTab: tab,
@@ -171,8 +168,6 @@ export function WalletShell(props: WalletShellProps) {
           <SidebarCard
             tab={tab}
             setTab={setTab}
-            agentActivated={agentActivated}
-            onActivateAgent={onActivateAgent}
             onLogout={onLogout}
           />
         </aside>
@@ -274,12 +269,10 @@ export function WalletShell(props: WalletShellProps) {
 // ────────────────────────────────────────────────────────────────────
 
 function SidebarCard({
-  tab, setTab, agentActivated, onActivateAgent, onLogout,
+  tab, setTab, onLogout,
 }: {
   tab: Tab;
   setTab: (t: Tab) => void;
-  agentActivated: boolean | null;
-  onActivateAgent: () => void;
   onLogout: () => void;
 }) {
   return (

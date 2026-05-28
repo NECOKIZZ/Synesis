@@ -398,7 +398,6 @@ function computeNextRunTime(
   if (frequency === "monthly") {
     const y = now.getUTCFullYear();
     const m = now.getUTCMonth();
-    const d = now.getUTCDate();
 
     if (lastDayOfMonthFlag) {
       // Try this month's last day; if already past, use next month's
