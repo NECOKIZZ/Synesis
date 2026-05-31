@@ -15,19 +15,26 @@
  * we record as `circle_tx_id` AND `idempotency_key`. Re-deliveries are
  * silently no-ops via the unique partial index from migration 0007.
  *
- * Auth: bearer token. Configure in Circle dashboard:
+ * Auth: Circle signs every notification with ECDSA. Each request carries:
+ *   X-Circle-Key-Id     — UUID of the signing key
+ *   X-Circle-Signature  — base64 ECDSA-SHA256 signature over the raw body
+ * We fetch the public key from Circle's API (cached in-process) and verify
+ * using node's crypto module. No shared secret is involved.
+ *
  *   POST   https://wallet.dotarc.my/api/webhooks/circle
- *   Header Authorization: Bearer <CIRCLE_WEBHOOK_SECRET>
+ *   HEAD   https://wallet.dotarc.my/api/webhooks/circle   (Circle health check)
  */
 
 import { NextResponse } from "next/server";
+import crypto from "node:crypto";
 import { createSupabaseServiceClient } from "@/lib/supabase/service";
 import { readUsdcBalanceWei } from "@/lib/circle";
 import { formatUnits } from "ethers";
 
 export const runtime = "nodejs";
 
-const WEBHOOK_SECRET = process.env.CIRCLE_WEBHOOK_SECRET;
+const CIRCLE_API_KEY = process.env.CIRCLE_API_KEY;
+const CIRCLE_API_BASE = process.env.CIRCLE_API_BASE ?? "https://api.circle.com";
 const USDC_ADDRESS =
   process.env.NEXT_PUBLIC_USDC_TOKEN_ADDRESS ||
   "0x3600000000000000000000000000000000000000";
@@ -73,6 +80,73 @@ interface MatchedWallet {
 }
 
 type SupabaseService = ReturnType<typeof createSupabaseServiceClient>;
+
+// ── Signature verification ───────────────────────────────────────────
+
+/**
+ * In-process cache of Circle's signing public keys, keyed by `keyId`.
+ * Keys are stable per `keyId`, so once fetched we never need to refetch
+ * until the lambda instance recycles. Saves a round-trip per webhook.
+ */
+const publicKeyCache = new Map<string, crypto.KeyObject>();
+
+async function fetchCirclePublicKey(keyId: string): Promise<crypto.KeyObject | null> {
+  const cached = publicKeyCache.get(keyId);
+  if (cached) return cached;
+  if (!CIRCLE_API_KEY) {
+    console.error("[webhooks/circle] CIRCLE_API_KEY missing — cannot fetch public key");
+    return null;
+  }
+
+  const res = await fetch(`${CIRCLE_API_BASE}/v2/notifications/publicKey/${keyId}`, {
+    headers: {
+      authorization: `Bearer ${CIRCLE_API_KEY}`,
+      accept: "application/json",
+    },
+  });
+  if (!res.ok) {
+    console.error("[webhooks/circle] public key fetch failed:", res.status, await res.text());
+    return null;
+  }
+
+  const json = (await res.json()) as {
+    data?: { publicKey?: string; algorithm?: string };
+  };
+  const b64 = json.data?.publicKey;
+  if (!b64) return null;
+
+  const keyObj = crypto.createPublicKey({
+    key: Buffer.from(b64, "base64"),
+    format: "der",
+    type: "spki",
+  });
+  publicKeyCache.set(keyId, keyObj);
+  return keyObj;
+}
+
+/**
+ * Verify the ECDSA-SHA256 signature on a raw webhook body.
+ * Returns true if the signature is valid, false otherwise.
+ */
+async function verifyCircleSignature(
+  rawBody: string,
+  keyId: string,
+  signatureB64: string
+): Promise<boolean> {
+  const publicKey = await fetchCirclePublicKey(keyId);
+  if (!publicKey) return false;
+  try {
+    return crypto.verify(
+      "sha256",
+      Buffer.from(rawBody, "utf8"),
+      publicKey,
+      Buffer.from(signatureB64, "base64")
+    );
+  } catch (err) {
+    console.error("[webhooks/circle] signature verify threw:", err);
+    return false;
+  }
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -273,24 +347,44 @@ async function recordInbound(args: {
 
 // ── Handler ──────────────────────────────────────────────────────────
 
+/**
+ * Circle pings the endpoint with HEAD requests as a reachability check
+ * when you register / re-enable the webhook. Just 200 it.
+ */
+export async function HEAD() {
+  return new Response(null, { status: 200 });
+}
+
 export async function POST(req: Request) {
-  // 1. Bearer-token auth. Skipped only if the secret isn't configured,
-  // which lets local dev work without a token but logs a warning so we
-  // don't ship to prod without one.
-  if (WEBHOOK_SECRET) {
-    const authHeader = req.headers.get("authorization") ?? "";
-    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-    if (token !== WEBHOOK_SECRET) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  // 1. Read the raw body BEFORE parsing — signature verification needs
+  // the exact bytes Circle signed, not a re-serialized JSON.
+  const rawBody = await req.text();
+
+  // 2. Verify the ECDSA signature using Circle's public key (cached).
+  // Skip only if we explicitly disabled it for local dev — never in prod.
+  const keyId = req.headers.get("x-circle-key-id");
+  const signature = req.headers.get("x-circle-signature");
+  const skipVerify = process.env.CIRCLE_WEBHOOK_SKIP_VERIFY === "true";
+
+  if (!skipVerify) {
+    if (!keyId || !signature) {
+      return NextResponse.json(
+        { error: "Missing signature headers" },
+        { status: 401 }
+      );
+    }
+    const valid = await verifyCircleSignature(rawBody, keyId, signature);
+    if (!valid) {
+      return NextResponse.json({ error: "Invalid signature" }, { status: 401 });
     }
   } else {
-    console.warn("[webhooks/circle] CIRCLE_WEBHOOK_SECRET not set — auth disabled");
+    console.warn("[webhooks/circle] CIRCLE_WEBHOOK_SKIP_VERIFY=true — signature check disabled");
   }
 
-  // 2. Parse body. Circle always sends JSON.
+  // 3. Parse body. Circle always sends JSON.
   let payload: CircleWebhookPayload;
   try {
-    payload = await req.json();
+    payload = JSON.parse(rawBody) as CircleWebhookPayload;
   } catch {
     return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
   }
