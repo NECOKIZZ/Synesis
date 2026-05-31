@@ -131,70 +131,75 @@ export default function HeroSection() {
       />
 
       {/* ── Nav Island ── */}
-      <div style={{
-        position: "absolute",
-        top: "24px",
-        left: "50%",
-        transform: "translateX(-50%)",
-        zIndex: 50,
-        display: "flex",
-        alignItems: "center",
-        gap: "8px",
-        padding: "10px 16px",
-        background: "rgba(255,255,255,0.25)",
-        backdropFilter: "blur(20px) saturate(180%)",
-        WebkitBackdropFilter: "blur(20px) saturate(180%)",
-        borderRadius: "50px",
-        border: "1px solid rgba(255,255,255,0.35)",
-        boxShadow: "0 8px 32px rgba(0,0,0,0.08), inset 0 1px 0 rgba(255,255,255,0.4)",
-      }}>
-        <button
-          disabled={!!navigating}
-          onClick={() => {
-            setNavigating("wallet");
-            router.push("/wallet");
-          }}
+      {/* Padding + font size scale down on mobile so the island doesn't
+          dominate small viewports. About + Docs replace Wallet + Agent —
+          the wallet is reachable via the prominent CTA top-right. */}
+      <div
+        className="hero-nav-island"
+        style={{
+          position: "absolute",
+          top: "20px",
+          left: "50%",
+          transform: "translateX(-50%)",
+          zIndex: 50,
+          display: "flex",
+          alignItems: "center",
+          gap: "4px",
+          background: "rgba(255,255,255,0.25)",
+          backdropFilter: "blur(20px) saturate(180%)",
+          WebkitBackdropFilter: "blur(20px) saturate(180%)",
+          borderRadius: "50px",
+          border: "1px solid rgba(255,255,255,0.35)",
+          boxShadow: "0 8px 32px rgba(0,0,0,0.08), inset 0 1px 0 rgba(255,255,255,0.4)",
+        }}
+      >
+        <style dangerouslySetInnerHTML={{ __html: `
+          .hero-nav-island { padding: 6px 8px; }
+          .hero-nav-link { padding: 6px 12px; font-size: 12px; }
+          @media (min-width: 640px) {
+            .hero-nav-island { padding: 8px 12px; }
+            .hero-nav-link { padding: 8px 14px; font-size: 14px; }
+          }
+        `}} />
+        <Link
+          href="/about"
+          className="hero-nav-link"
           style={{
-            padding: "8px 14px",
             borderRadius: "50px",
-            color: navigating === "wallet" ? "rgba(26,26,26,0.5)" : "#1a1a1a",
+            color: "#1a1a1a",
             fontFamily: "'Clash Display', sans-serif",
-            fontSize: "14px",
             fontWeight: 500,
             textDecoration: "none",
             transition: "all 0.3s ease",
-            background: "transparent",
-            border: "none",
-            cursor: navigating === "wallet" ? "wait" : "pointer",
           }}
           onMouseEnter={(e) => {
-            if (navigating) return;
             e.currentTarget.style.background = "rgba(255,255,255,0.5)";
-            warmSession();
           }}
-          onFocus={warmSession}
-          onTouchStart={warmSession}
           onMouseLeave={(e) => {
             e.currentTarget.style.background = "transparent";
           }}
         >
-          {navigating === "wallet" ? "Opening…" : "Wallet"}
-        </button>
-        <Link href="/agent" style={{
-          padding: "8px 14px",
-          borderRadius: "50px",
-          color: "#1a1a1a",
-          fontFamily: "'Clash Display', sans-serif",
-          fontSize: "14px",
-          fontWeight: 500,
-          textDecoration: "none",
-          transition: "all 0.3s ease",
-        }} onMouseEnter={(e) => {
-          e.currentTarget.style.background = "rgba(255,255,255,0.5)";
-        }} onMouseLeave={(e) => {
-          e.currentTarget.style.background = "transparent";
-        }}>
-          Agent
+          About
+        </Link>
+        <Link
+          href="/docs"
+          className="hero-nav-link"
+          style={{
+            borderRadius: "50px",
+            color: "#1a1a1a",
+            fontFamily: "'Clash Display', sans-serif",
+            fontWeight: 500,
+            textDecoration: "none",
+            transition: "all 0.3s ease",
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.background = "rgba(255,255,255,0.5)";
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = "transparent";
+          }}
+        >
+          Docs
         </Link>
       </div>
 

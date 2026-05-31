@@ -184,6 +184,7 @@ export const SendToken: SkillHandler = {
       .from("agent_spend_log")
       .insert({
         user_id:            supabaseUserId,
+        wallet_type:        "agent",
         skill:              "SEND_TOKEN",
         recipient_address:  recipientAddress,
         recipient_arc_name: recipient.startsWith("0x") ? null : normalizeName(recipient),

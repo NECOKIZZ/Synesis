@@ -97,7 +97,7 @@ When we add Google OAuth (and certainly when we add the agent), we'll need Postg
 
 - [ ] Vercel project set up
 - [ ] Env vars added in Vercel dashboard
-- [ ] `wallet.dotarc.app` DNS pointed once domain is purchased
+- [ ] `wallet.dotarc.my` DNS pointed once domain is purchased
 
 ---
 

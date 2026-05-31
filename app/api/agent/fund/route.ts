@@ -9,7 +9,7 @@
  */
 
 import { NextResponse } from "next/server";
-import { requireAgentSession } from "@/lib/agent";
+import { requireAgentSession, enforceAgentGate } from "@/lib/agent";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { prepareUserSendUsdc, readUsdcBalanceWei } from "@/lib/circle";
 import { isAddress, formatUnits } from "ethers";
@@ -20,6 +20,7 @@ export async function POST(req: Request) {
   let agentSession: Awaited<ReturnType<typeof requireAgentSession>>;
   try {
     agentSession = await requireAgentSession();
+    await enforceAgentGate(agentSession.supabaseUserId);
   } catch (res) {
     return res as Response;
   }

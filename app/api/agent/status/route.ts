@@ -10,7 +10,7 @@
  */
 
 import { NextResponse } from "next/server";
-import { requireAgentSession, getAgentBalance } from "@/lib/agent";
+import { requireAgentSession, getAgentBalance, isAgentEnabled } from "@/lib/agent";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 
 export const runtime = "nodejs";
@@ -25,6 +25,14 @@ export async function GET() {
 
   const { supabaseUserId } = agentSession;
   const supabase = await createSupabaseServerClient();
+
+  // ── Invite gate ───────────────────────────────────────────────────
+  // Smart Agent is invite-only. Non-invited users see a "coming soon"
+  // screen via the `gated` flag instead of a 403 error.
+  const enabled = await isAgentEnabled(supabaseUserId);
+  if (!enabled) {
+    return NextResponse.json({ activated: false, gated: true });
+  }
 
   // ── Agent wallet ──────────────────────────────────────────────────
   const { data: wallet } = await supabase

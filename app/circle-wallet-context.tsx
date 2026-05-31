@@ -46,9 +46,10 @@ interface CircleWalletState {
   registerName: (name: string) => Promise<{ arcName: string; txHash: string }>;
   /**
    * Execute a Circle challenge (e.g. a send transaction) via the browser SDK
-   * (PIN dialog). Reuses the singleton SDK instance managed by this context.
+   * (PIN dialog). Resolves with `{ txHash }` on COMPLETE — `txHash` is null
+   * for sign-only challenges that don't broadcast a transaction.
    */
-  executeChallenge: (challengeId: string, userToken: string, encryptionKey: string) => Promise<void>;
+  executeChallenge: (challengeId: string, userToken: string, encryptionKey: string) => Promise<{ txHash: string | null }>;
   logout: () => Promise<void>;
   refresh: () => Promise<void>;
   clearError: () => void;
@@ -60,7 +61,7 @@ const CircleWalletContext = createContext<CircleWalletState>({
   error: null,
   startCircleFlow: async () => {},
   registerName: async () => ({ arcName: "", txHash: "" }),
-  executeChallenge: async () => {},
+  executeChallenge: async () => ({ txHash: null }),
   logout: async () => {},
   refresh: async () => {},
   clearError: () => {},
@@ -285,19 +286,31 @@ export function CircleWalletProvider({ children }: { children: React.ReactNode }
     challengeId: string,
     userToken: string,
     encryptionKey: string
-  ) => {
+  ): Promise<{ txHash: string | null }> => {
     const sdk = await getSdk();
     sdk.setAuthentication({ userToken, encryptionKey });
-    await new Promise<void>((resolve, reject) => {
+    return await new Promise<{ txHash: string | null }>((resolve, reject) => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       sdk.execute(challengeId, (err: any, result: any) => {
         if (err) {
           reject(new Error(err.message || err.code || "Challenge cancelled"));
           return;
         }
-        if (result?.status === "COMPLETE") resolve();
-        else if (result?.status === "FAILED" || result?.status === "ERROR")
+        if (result?.status === "COMPLETE") {
+          // Circle's SDK callback shape varies between challenge types; sweep
+          // a few likely places for the tx hash. If none match, return null
+          // and let the caller fall back to the explorer's address page.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const data = result?.data as any;
+          const txHash =
+            (typeof data?.txHash === "string" && data.txHash) ||
+            (typeof data?.transactionHash === "string" && data.transactionHash) ||
+            (typeof result?.txHash === "string" && result.txHash) ||
+            null;
+          resolve({ txHash });
+        } else if (result?.status === "FAILED" || result?.status === "ERROR") {
           reject(new Error(`Transaction ${result.status.toLowerCase()}`));
+        }
       });
     });
   }, [getSdk]);

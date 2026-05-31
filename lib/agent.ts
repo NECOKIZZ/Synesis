@@ -125,6 +125,55 @@ export async function requireAgentSession(): Promise<AgentSession> {
   return { session, supabaseUserId: claimUserId };
 }
 
+/**
+ * Throws a 403 Response if the user does not have Smart Agent access.
+ * Call this AFTER `requireAgentSession()` in any agent mutation route.
+ *
+ * The status route (/api/agent/status) is the only exception — it checks
+ * the flag itself and returns `{ activated: false, gated: true }` so the
+ * UI can show a "coming soon" state without flagging the call as an error.
+ */
+export async function enforceAgentGate(supabaseUserId: string): Promise<void> {
+  const supabase = await createSupabaseServerClient();
+  const { data, error } = await supabase
+    .from("profiles")
+    .select("agent_enabled")
+    .eq("id", supabaseUserId)
+    .maybeSingle();
+
+  if (error) {
+    throw new Response(
+      JSON.stringify({ error: "Profile lookup failed", code: "PROFILE_ERROR" }),
+      { status: 500, headers: { "Content-Type": "application/json" } },
+    );
+  }
+
+  if (!data?.agent_enabled) {
+    throw new Response(
+      JSON.stringify({
+        error: "Smart Agent is invite-only. Join the waitlist for early access.",
+        code: "AGENT_GATED",
+      }),
+      { status: 403, headers: { "Content-Type": "application/json" } },
+    );
+  }
+}
+
+/**
+ * Non-throwing variant of `enforceAgentGate`. Returns true if the user has
+ * Smart Agent access. Used by /api/agent/status to differentiate gated vs
+ * unactivated states cleanly.
+ */
+export async function isAgentEnabled(supabaseUserId: string): Promise<boolean> {
+  const supabase = await createSupabaseServerClient();
+  const { data } = await supabase
+    .from("profiles")
+    .select("agent_enabled")
+    .eq("id", supabaseUserId)
+    .maybeSingle();
+  return Boolean(data?.agent_enabled);
+}
+
 // ── PIN hashing (bcryptjs) ────────────────────────────────────────────
 
 const BCRYPT_ROUNDS = 12;

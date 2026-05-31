@@ -14,7 +14,7 @@ Living document. Updated as decisions are made.
 | **Sign-in (future)** | Add Google OAuth |
 | **Existing MetaMask flow** | Untouched — coexists with Circle path |
 | **Hosting** | Path-based: `dotarc.vercel.app/wallet` |
-| **Hosting (future)** | Subdomain `wallet.dotarc.app` once a real domain is purchased |
+| **Hosting (future)** | Subdomain `wallet.dotarc.my` once a real domain is purchased |
 | **Treasury signing** | Circle `createContractExecutionTransaction` API (MPC — no raw private key exists or is needed) |
 | **Database** | None for MVP — Circle is the user DB, registry contract is the name DB, JWT cookie for sessions |
 | **Name ownership** | Spec Option A — treasury owns, name resolves to user's wallet (cleaner recovery) |
@@ -70,7 +70,7 @@ No database. Circle holds user data. Registry holds name data. Cookie holds sess
 7. **Send-fee skim** (0.5% protocol fee on transfers, Spec §7 Strategy 3)
 8. **Agent wallets** (`-agent.arc` registrations) — already partially supported via existing `/agent/register` endpoint
 9. **Payment app wallets** (`-usdc.arc`) — same
-10. **Subdomain split** — move `/wallet/*` to its own Vercel project at `wallet.dotarc.app` once a real domain is owned
+10. **Subdomain split** — move `/wallet/*` to its own Vercel project at `wallet.dotarc.my` once a real domain is owned
 11. **Replace raw `TREASURY_PRIVATE_KEY`** with Circle's transaction signing API (mainnet hardening)
 12. **Option B name ownership** — let users transfer name ownership from treasury to themselves once they have USDC
 

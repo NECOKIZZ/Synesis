@@ -3,7 +3,7 @@
 import { useCallback, useState } from "react";
 
 const APP_BASE_URL =
-  process.env.NEXT_PUBLIC_APP_URL || "https://wallet.dotarc.app";
+  process.env.NEXT_PUBLIC_APP_URL || "https://wallet.dotarc.my";
 
 interface ReceiveModalProps {
   walletAddress: string;

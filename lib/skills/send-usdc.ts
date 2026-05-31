@@ -104,6 +104,7 @@ export const SendUsdc: SkillHandler = {
       .from("agent_spend_log")
       .insert({
         user_id: supabaseUserId,
+        wallet_type: "agent",
         skill: "SEND_USDC",
         recipient_address: recipientAddress,
         recipient_arc_name: recipient.trim().startsWith("0x") ? null : normalizeName(recipient),

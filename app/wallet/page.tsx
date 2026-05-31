@@ -6,6 +6,7 @@ import { useCircleWallet } from "../circle-wallet-context";
 import { AuthGate } from "../auth-gate";
 import { SendModal } from "./send-modal";
 import { ReceiveModal } from "./receive-modal";
+import { QrModal } from "./qr-modal";
 import { RequestModal } from "./request-modal";
 import { WalletShell, type ActivityRow, type Tab, type TokenBalance } from "./wallet-shell";
 import WalletLoading from "./loading";
@@ -41,6 +42,7 @@ export default function WalletPage() {
   const [showReceive, setShowReceive] = useState(false);
   const [showSend, setShowSend] = useState(false);
   const [showRequest, setShowRequest] = useState(false);
+  const [showQr, setShowQr] = useState(false);
   const [agentActivated, setAgentActivated] = useState<boolean | null>(null);
   const [activity, setActivity] = useState<ActivityRow[]>([]);
   const [activeTab, setActiveTab] = useState<Tab>("home");
@@ -390,6 +392,7 @@ export default function WalletPage() {
         activity={activity}
         onSend={() => setShowSend(true)}
         onReceive={() => setShowReceive(true)}
+        onShowQr={() => setShowQr(true)}
         onRequest={handleRequest}
         onCopyAddress={copyAddress}
         onActivateAgent={() => setActiveTab("agent")}
@@ -454,6 +457,14 @@ export default function WalletPage() {
           walletAddress={session.walletAddress}
           arcName={session.arcName}
           onClose={() => setShowReceive(false)}
+        />
+      )}
+
+      {showQr && (
+        <QrModal
+          walletAddress={session.walletAddress}
+          arcName={session.arcName}
+          onClose={() => setShowQr(false)}
         />
       )}
 

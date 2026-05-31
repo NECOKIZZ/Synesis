@@ -70,6 +70,7 @@ export const Withdraw: SkillHandler = {
       .from("agent_spend_log")
       .insert({
         user_id: supabaseUserId,
+        wallet_type: "agent",
         skill: "WITHDRAW",
         recipient_address: mainWalletAddress,
         amount_usdc: amountUsdc,

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useCircleWallet } from "../circle-wallet-context";
 import { QrScanner } from "./qr-scanner";
 import { ArcLoader } from "@/app/components/arc-loader";
+import { friendlyError, friendlyApiError } from "@/lib/friendly-errors";
 
 const ARC_EXPLORER =
   process.env.NEXT_PUBLIC_ARC_EXPLORER_URL || "https://testnet.arcscan.app/tx/";
@@ -61,6 +62,14 @@ export function SendModal({ onClose, onSent }: SendModalProps) {
   // ── What the SERVER resolved (used in confirm + signing)
   const [prepared, setPrepared] = useState<PrepareResponse | null>(null);
 
+  // ── Tx hash captured from Circle SDK on success (null until done)
+  const [txHash, setTxHash] = useState<string | null>(null);
+
+  // ── Signing-step status escalation. After ~4s of waiting we swap the
+  //    label to a friendlier "still loading" message so the user knows
+  //    the lag is on Circle's end, not a bug.
+  const [signingStalled, setSigningStalled] = useState(false);
+
   // ── QR scanner
   const [showScanner, setShowScanner] = useState(false);
 
@@ -101,16 +110,16 @@ export function SendModal({ onClose, onSent }: SendModalProps) {
         credentials: "include",
         body: JSON.stringify({ recipient: recipient.trim(), amount: amount.trim() }),
       });
-      const data = await res.json();
       if (!res.ok) {
-        setErrorMsg(data.error || `Prepare failed (${res.status})`);
+        setErrorMsg(await friendlyApiError(res, "Couldn't prepare the transfer. Try again."));
         setStep("input");
         return;
       }
+      const data = await res.json();
       setPrepared(data as PrepareResponse);
       setStep("confirm");
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Network error. Try again.");
+      setErrorMsg(friendlyError(err, "Couldn't reach the server. Check your connection and try again."));
       setStep("input");
     }
   }, [recipient, amount]);
@@ -119,27 +128,49 @@ export function SendModal({ onClose, onSent }: SendModalProps) {
   const handleConfirm = useCallback(async () => {
     if (!prepared) return;
     setErrorMsg(null);
+    setSigningStalled(false);
     setStep("signing");
 
     try {
-      await executeChallenge(prepared.challengeId, prepared.userToken, prepared.encryptionKey);
+      const result = await executeChallenge(
+        prepared.challengeId,
+        prepared.userToken,
+        prepared.encryptionKey
+      );
+      // Paint the success UI BEFORE telling the parent to refresh.
+      // Otherwise the parent's re-render can race with our state update
+      // and unmount us before "done" is visible.
+      setTxHash(result.txHash);
       setStep("done");
       onSent();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Transaction failed";
+      const msg = err instanceof Error ? err.message : String(err);
       const isNetworkError = /timeout|reset|connect|network|fetch|econnreset/i.test(msg);
       if (isNetworkError) {
         // Transaction may have been broadcast before the connection dropped.
-        // Show an honest uncertain state rather than hard failure.
-        setErrorMsg("Network error during confirmation. Your transaction may have gone through — check your activity feed before retrying to avoid a duplicate send.");
+        // Honest "uncertain" state so the user knows to check before retrying.
+        setErrorMsg(
+          "Connection dropped while confirming. Your transfer may still have gone through — check your activity feed before retrying."
+        );
         setStep("failed");
-        onSent(); // still refresh balance/activity so user can verify
+        onSent(); // refresh balance/activity so the user can verify
         return;
       }
-      setErrorMsg(msg);
+      setErrorMsg(friendlyError(err, "Transaction couldn't be completed."));
       setStep("failed");
     }
   }, [prepared, executeChallenge, onSent]);
+
+  // While we're in the signing step, escalate the loading copy if Circle
+  // takes more than ~4s to surface its PIN dialog.
+  useEffect(() => {
+    if (step !== "signing") {
+      setSigningStalled(false);
+      return;
+    }
+    const t = setTimeout(() => setSigningStalled(true), 4000);
+    return () => clearTimeout(t);
+  }, [step]);
 
   const handleClose = useCallback(() => {
     // Don't allow dismissal while PIN dialog or prepare is in flight
@@ -344,12 +375,54 @@ export function SendModal({ onClose, onSent }: SendModalProps) {
           )}
 
           {/* ════════════════════════════════════════ SIGNING STEP */}
+          {/* Keep the prepared transaction summary visible behind the loader
+              so the user always knows what they're confirming, even if
+              Circle's PIN dialog hasn't surfaced yet. The escalating label
+              after ~4s explains lag without alarming. */}
           {step === "signing" && (
-            <ArcLoader
-              size="card"
-              label="Waiting for PIN confirmation…"
-              showFacts={false}
-            />
+            <div className="space-y-4">
+              {prepared && (
+                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                  <div className="space-y-3">
+                    <Row
+                      label="To"
+                      value={
+                        prepared.resolvedName ? (
+                          <span>
+                            <span className="font-semibold text-blue-400">
+                              {prepared.resolvedName.split(".")[0]}
+                            </span>
+                            <span className="text-white/50">.arc</span>
+                          </span>
+                        ) : (
+                          <span className="break-all font-mono text-xs text-white/80">
+                            {shortAddr(prepared.resolvedAddress)}
+                          </span>
+                        )
+                      }
+                    />
+                    <Row
+                      label="Amount"
+                      value={
+                        <span className="font-semibold text-white">
+                          {formatUsdc(prepared.amount)}{" "}
+                          <span className="font-normal text-white/50">USDC</span>
+                        </span>
+                      }
+                    />
+                  </div>
+                </div>
+              )}
+              <ArcLoader
+                size="card"
+                label={
+                  signingStalled
+                    ? "Still loading — give it a moment"
+                    : "Opening secure PIN entry…"
+                }
+                showFacts={false}
+              />
+            </div>
           )}
 
           {/* ════════════════════════════════════════ DONE STEP */}
@@ -370,14 +443,19 @@ export function SendModal({ onClose, onSent }: SendModalProps) {
               <p className="mt-2 text-xs text-white/30">
                 Your balance will update once confirmed on Arc Testnet.
               </p>
-              <a
-                href={ARC_EXPLORER}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="mt-3 inline-block text-xs text-blue-400 hover:underline"
-              >
-                View Arc Explorer →
-              </a>
+              {/* Only render the explorer link when we have a real tx hash;
+                  a base-URL link without a hash lands on the explorer
+                  homepage and feels broken. */}
+              {txHash && (
+                <a
+                  href={`${ARC_EXPLORER}${txHash}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="mt-3 inline-block text-xs text-blue-400 hover:underline"
+                >
+                  View on Arc Explorer →
+                </a>
+              )}
               <button
                 onClick={onClose}
                 className="mt-5 w-full rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-blue-500"

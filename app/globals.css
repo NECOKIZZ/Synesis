@@ -28,17 +28,68 @@ body {
 
 /* Wallet page overrides — allow scroll. Background painted by the
    wallet component itself so non-authenticated states can pick their
-   own theme. */
+   own theme.
+
+   IMPORTANT: this element must have a FIXED height (not min-height) for
+   `overflow-y: auto` to create a real scroll container. With only
+   `min-height`, the element grows to fit its content and the parent
+   body's `overflow: hidden` ends up clipping — which is why Android
+   scrolling broke on the activity tab. `-webkit-overflow-scrolling:
+   touch` keeps iOS momentum-scrolling smooth. */
 .wallet-page {
+  height: 100vh;
+  height: 100dvh;
   overflow-y: auto;
-  min-height: 100vh;
-  min-height: 100dvh;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
 }
 
 /* Hide scrollbars for elements that scroll horizontally on mobile but
    shouldn't show a track (e.g. action button rows). */
 .no-scrollbar::-webkit-scrollbar { display: none; }
 .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+/* ── Custom scrollbars (desktop) ──
+   Thin, branded scrollbars that fade against the dark navy backdrop.
+   We scope to `.wallet-page` and any nested scrollers so we never touch
+   user-agent UI outside the app. Mobile browsers ignore these and use
+   their native overlay scrollbars — which is what we want. */
+.wallet-page,
+.wallet-page *:not(.no-scrollbar) {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.22) transparent;
+}
+
+.wallet-page::-webkit-scrollbar,
+.wallet-page *:not(.no-scrollbar)::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.wallet-page::-webkit-scrollbar-track,
+.wallet-page *:not(.no-scrollbar)::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.wallet-page::-webkit-scrollbar-thumb,
+.wallet-page *:not(.no-scrollbar)::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  transition: background-color 0.2s ease;
+}
+
+.wallet-page::-webkit-scrollbar-thumb:hover,
+.wallet-page *:not(.no-scrollbar)::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.32);
+  background-clip: padding-box;
+}
+
+.wallet-page::-webkit-scrollbar-corner,
+.wallet-page *:not(.no-scrollbar)::-webkit-scrollbar-corner {
+  background: transparent;
+}
 
 /* Clash Display uppercase utility */
 .font-clash {

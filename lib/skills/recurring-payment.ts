@@ -253,6 +253,7 @@ export const RecurringPayment: SkillHandler = {
       .from("agent_spend_log")
       .insert({
         user_id: supabaseUserId,
+        wallet_type: "agent",
         skill: "RECURRING_PAYMENT",
         policy_id: policy.id,
         recipient_address: recipientAddress,

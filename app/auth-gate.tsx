@@ -14,6 +14,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createSupabaseBrowserClient, isSupabaseConfigured } from "@/lib/supabase/client";
 import { ArcLoader } from "@/app/components/arc-loader";
+import { friendlyError } from "@/lib/friendly-errors";
 
 type Mode = "choose" | "email-input" | "code-input" | "google-redirecting";
 
@@ -107,7 +108,7 @@ export function AuthGate({
       if (err) throw err;
       // Browser will redirect away. If it doesn't, fall back.
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Google sign-in failed");
+      setError(friendlyError(err, "Google sign-in failed. Please try again."));
       setMode("choose");
       setBusy(false);
     }
@@ -129,7 +130,7 @@ export function AuthGate({
       setInfo(`We sent a 6-digit code to ${email}. Check your inbox.`);
       setMode("code-input");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not send code");
+      setError(friendlyError(err, "Couldn't send the code. Please try again."));
     } finally {
       setBusy(false);
     }
@@ -152,17 +153,19 @@ export function AuthGate({
       if (!verified) throw new Error("No email returned from verification");
       onVerified(verified.toLowerCase());
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Invalid or expired code");
+      setError(friendlyError(err, "That code is wrong or expired. Try a new one."));
     } finally {
       setBusy(false);
     }
   };
 
   if (mode === "google-redirecting") {
+    // Skip the Shell wrapper here so its top-mounted .arc mark doesn't
+    // double up with the animated wordmark inside ArcLoader.
     return (
-      <Shell>
+      <div className="flex min-h-dvh w-full items-center justify-center px-6 py-12">
         <ArcLoader size="card" label="Redirecting to Google" showFacts={false} />
-      </Shell>
+      </div>
     );
   }
 
@@ -290,19 +293,18 @@ export function AuthGate({
  */
 function Shell({ children }: { children: React.ReactNode }) {
   return (
-    <div className="relative flex min-h-screen w-full flex-col items-center justify-center px-6 py-16">
-      {/* .arc logo — pinned near the top */}
-      <div className="absolute left-1/2 top-20 -translate-x-1/2 sm:top-24">
-        {/* Plain <img> over next/image: intrinsic dimensions of the asset
-            are unknown, and we only need a small rendered size. */}
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
-          src="/arc-logo.png"
-          alt=".arc"
-          className="h-14 w-auto select-none sm:h-16"
-          draggable={false}
-        />
-      </div>
+    // The logo lives in normal flow above the headline so a tall headline
+    // (e.g. on a short viewport with the clamp at its upper bound) can never
+    // collide with the absolutely-positioned mark. `gap-10` keeps the visual
+    // breathing room. `min-h-dvh` prevents the iOS bottom-bar overshoot.
+    <div className="relative flex min-h-dvh w-full flex-col items-center justify-center gap-10 px-6 py-12 sm:py-16">
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src="/arc-logo.png"
+        alt=".arc"
+        className="h-10 w-auto select-none sm:h-12"
+        draggable={false}
+      />
       <div className="flex w-full flex-col items-center">{children}</div>
     </div>
   );
@@ -315,7 +317,7 @@ function Headline({ children }: { children: React.ReactNode }) {
       className="text-center font-clash font-bold uppercase leading-[0.95] text-white"
       style={{
         fontFamily: "'Clash Display', sans-serif",
-        fontSize: "clamp(40px, 8vw, 76px)",
+        fontSize: "clamp(36px, 7vw, 60px)",
         letterSpacing: "-0.02em",
       }}
     >

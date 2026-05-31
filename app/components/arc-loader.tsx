@@ -81,36 +81,34 @@ export function ArcLoader({
         isFull ? "min-h-screen" : "py-8"
       } ${className}`}
     >
-      {/* Animated .arc mark */}
-      <div className="relative">
-        {/* Glow ring */}
-        <div
-          className="arc-glow-ring absolute inset-0 -m-3 rounded-full border border-white/20"
+      {/* Animated .arc mark — bare wordmark, no tile, with concentric
+          glow rings that pulse outward. The wordmark itself breathes so
+          there's still a clear focal point. */}
+      <div className="relative inline-flex items-center justify-center">
+        <span
+          aria-hidden
+          className="absolute inset-0 -m-4 rounded-full border border-white/15"
           style={{
             animation: "arc-glow-ping 2.4s ease-in-out infinite",
           }}
         />
-        <div
-          className="arc-glow-ring absolute inset-0 -m-6 rounded-full border border-white/10"
+        <span
+          aria-hidden
+          className="absolute inset-0 -m-8 rounded-full border border-white/8"
           style={{
             animation: "arc-glow-ping 2.4s ease-in-out infinite 0.8s",
           }}
         />
 
-        {/* Logo tile */}
-        <div
-          className="relative flex h-14 w-14 items-center justify-center rounded-2xl bg-white/15 backdrop-blur-sm sm:h-16 sm:w-16"
+        <span
+          className="relative font-clash text-3xl font-semibold tracking-tight text-white sm:text-4xl"
           style={{
+            fontFamily: "'Clash Display', sans-serif",
             animation: "arc-breathe 2s ease-in-out infinite",
           }}
         >
-          <span
-            className="font-clash text-2xl font-semibold text-white sm:text-3xl"
-            style={{ fontFamily: "'Clash Display', sans-serif" }}
-          >
-            .arc
-          </span>
-        </div>
+          .arc
+        </span>
       </div>
 
       {/* Label */}

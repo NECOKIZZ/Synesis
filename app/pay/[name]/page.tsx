@@ -1,7 +1,7 @@
 import { resolveName, normalizeName } from "@/lib/ans";
 import Link from "next/link";
 
-const APP_URL = process.env.NEXT_PUBLIC_APP_URL || "https://wallet.dotarc.app";
+const APP_URL = process.env.NEXT_PUBLIC_APP_URL || "https://wallet.dotarc.my";
 
 interface Props {
   params: Promise<{ name: string }>;

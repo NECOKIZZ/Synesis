@@ -43,6 +43,7 @@ import {
   Sparkles,
   X,
   ChevronRight,
+  Lock,
 } from "lucide-react";
 
 const ARC_EXPLORER = process.env.NEXT_PUBLIC_ARC_EXPLORER_URL || "https://testnet.arcscan.app/tx/";
@@ -81,6 +82,7 @@ export interface WalletShellProps {
   activity: ActivityRow[];
   onSend: () => void;
   onReceive: () => void;
+  onShowQr: () => void;          // hero QR tile click — opens QR-only modal
   onRequest: () => void;        // opens receive in "request a payment" mode
   onCopyAddress: () => void;
   onActivateAgent: () => void;
@@ -101,6 +103,7 @@ export function WalletShell(props: WalletShellProps) {
     activity,
     onSend,
     onReceive,
+    onShowQr,
     onRequest,
     onCopyAddress,
     onLogout,
@@ -164,7 +167,15 @@ export function WalletShell(props: WalletShellProps) {
       <div className="mx-auto flex w-full max-w-[1400px] flex-col gap-4 p-3 sm:p-5 md:flex-row md:gap-6 md:p-6 lg:p-8">
 
         {/* ── Sidebar (desktop) ── */}
-        <aside className="hidden md:flex md:w-[240px] lg:w-[260px] md:shrink-0 md:flex-col" style={{flexShrink:0}}>
+        {/* `md:sticky` + `md:self-start` keeps the sidebar pinned and stops
+            flexbox from stretching it to match a tall main column (which
+            was making the sidebar elongate on the activity tab). Height is
+            capped to the visible viewport so the sidebar never grows past
+            one screen, regardless of how long the activity list is. */}
+        <aside
+          className="hidden md:sticky md:top-6 md:flex md:h-[calc(100dvh-3rem)] md:w-[200px] md:shrink-0 md:flex-col md:self-start lg:w-[220px]"
+          style={{ flexShrink: 0 }}
+        >
           <SidebarCard
             tab={tab}
             setTab={setTab}
@@ -181,15 +192,15 @@ export function WalletShell(props: WalletShellProps) {
               <img
                 src="/arc-logo.png"
                 alt=".arc"
-                className="h-10 w-auto select-none"
+                className="h-8 w-auto select-none"
                 draggable={false}
               />
             </Link>
             <button
               onClick={onLogout}
-              className="flex items-center gap-1.5 rounded-full bg-white/15 px-3 py-1.5 text-xs font-medium text-white backdrop-blur-sm transition active:bg-white/25"
+              className="flex items-center gap-1.5 rounded-full bg-white/15 px-2.5 py-1 text-[11px] font-medium text-white backdrop-blur-sm transition active:bg-white/25"
             >
-              <LogOut size={13} />
+              <LogOut size={12} />
               Sign out
             </button>
           </div>
@@ -213,6 +224,7 @@ export function WalletShell(props: WalletShellProps) {
                   tokenBalances={tokenBalances}
                   qrDataUrl={qrDataUrl}
                   onReceive={onReceive}
+                  onShowQr={onShowQr}
                   onSend={onSend}
                   onRequest={onRequest}
                   onCopyAddress={onCopyAddress}
@@ -229,29 +241,29 @@ export function WalletShell(props: WalletShellProps) {
 
       {/* ── Mobile bottom nav ── */}
       <nav
-        className="fixed inset-x-0 bottom-0 z-40 flex justify-around border-t border-white/20 bg-[#2c5994]/95 px-2 py-2 backdrop-blur-md md:hidden"
-        style={{ paddingBottom: "max(0.5rem, env(safe-area-inset-bottom))" }}
+        className="fixed inset-x-0 bottom-0 z-40 flex justify-around border-t border-white/20 bg-[#2c5994]/95 px-1.5 py-1.5 backdrop-blur-md md:hidden"
+        style={{ paddingBottom: "max(0.375rem, env(safe-area-inset-bottom))" }}
       >
         <MobileNavBtn
-          icon={<HomeIcon size={20} />}
+          icon={<HomeIcon size={17} />}
           label="Home"
           active={tab === "home"}
           onClick={() => setTab("home")}
         />
         <MobileNavBtn
-          icon={<ActivityIcon size={20} />}
+          icon={<ActivityIcon size={17} />}
           label="Activity"
           active={tab === "activity"}
           onClick={() => setTab("activity")}
         />
         <MobileNavBtn
-          icon={<Bot size={20} />}
+          icon={<Bot size={17} />}
           label="Agent"
           active={tab === "agent"}
           onClick={() => setTab("agent")}
         />
         <MobileNavBtn
-          icon={<List size={20} />}
+          icon={<List size={17} />}
           label="Policies"
           active={tab === "policies"}
           onClick={() => setTab("policies")}
@@ -259,7 +271,7 @@ export function WalletShell(props: WalletShellProps) {
       </nav>
 
       {/* Spacer so content isn't covered by mobile nav */}
-      <div className="h-20 md:hidden" />
+      <div className="h-16 md:hidden" />
     </div>
   );
 }
@@ -277,7 +289,10 @@ function SidebarCard({
 }) {
   return (
     <div
-      className="relative flex h-full min-h-[calc(100dvh-3rem)] flex-col overflow-hidden rounded-3xl p-6"
+      // `h-full` fills the aside (which now provides its own height cap).
+      // Removing the old `min-h-[calc(100dvh-3rem)]` was the fix — that
+      // floor was forcing the sidebar to grow with sibling content.
+      className="relative flex h-full flex-col overflow-hidden rounded-3xl p-6"
       style={{
         // Soft top highlight + bottom-corner glow over the brand-blue base.
         backgroundColor: "#4a82c8",
@@ -291,14 +306,14 @@ function SidebarCard({
       {/* Brand */}
       <Link
         href="/"
-        className="mb-10 inline-flex items-center"
+        className="mb-8 inline-flex items-center"
         aria-label=".arc home"
       >
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
           src="/arc-logo.png"
           alt=".arc"
-          className="h-12 w-auto select-none"
+          className="h-10 w-auto select-none"
           draggable={false}
         />
       </Link>
@@ -306,25 +321,25 @@ function SidebarCard({
       {/* Nav */}
       <nav className="flex flex-col gap-1.5">
         <SidebarItem
-          icon={<HomeIcon size={18} />}
+          icon={<HomeIcon size={16} />}
           label="Home"
           active={tab === "home"}
           onClick={() => setTab("home")}
         />
         <SidebarItem
-          icon={<ActivityIcon size={18} />}
+          icon={<ActivityIcon size={16} />}
           label="Activity"
           active={tab === "activity"}
           onClick={() => setTab("activity")}
         />
         <SidebarItem
-          icon={<Bot size={18} />}
+          icon={<Bot size={16} />}
           label="Agent"
           active={tab === "agent"}
           onClick={() => setTab("agent")}
         />
         <SidebarItem
-          icon={<List size={18} />}
+          icon={<List size={16} />}
           label="Policies"
           active={tab === "policies"}
           onClick={() => setTab("policies")}
@@ -362,7 +377,7 @@ function SidebarItem({
     <button
       onClick={onClick}
       className={
-        "flex w-full items-center gap-3 rounded-full px-4 py-2.5 text-left font-clash text-base font-semibold transition " +
+        "flex w-full items-center gap-2.5 rounded-full px-3.5 py-2 text-left font-clash text-sm font-semibold transition " +
         (active
           ? "bg-white text-[#2563a6] shadow-sm"
           : "text-white/90 hover:bg-white/10")
@@ -387,13 +402,13 @@ function MobileNavBtn({
     <button
       onClick={onClick}
       className={
-        "flex flex-1 flex-col items-center gap-0.5 rounded-2xl px-2 py-1.5 transition " +
+        "flex flex-1 flex-col items-center gap-0.5 rounded-2xl px-1.5 py-1 transition " +
         (active ? "bg-white text-[#2563a6]" : "text-white/85 hover:text-white")
       }
     >
       {icon}
       <span
-        className="font-clash text-[10px] font-semibold uppercase tracking-wider"
+        className="font-clash text-[9px] font-semibold uppercase tracking-wide"
         style={{ fontFamily: "'Clash Display', sans-serif" }}
       >
         {label}
@@ -446,13 +461,14 @@ function HomeTab(props: {
   qrDataUrl: string | null;
   onSend: () => void;
   onReceive: () => void;
+  onShowQr: () => void;
   onRequest: () => void;
   onCopyAddress: () => void;
   copiedAddress: boolean;
 }) {
   const {
     displayName, arcName, intPart, fracPart, balanceLoading, tokenBalances, qrDataUrl,
-    onSend, onReceive, onRequest, onCopyAddress, copiedAddress,
+    onSend, onReceive, onShowQr, onRequest, onCopyAddress, copiedAddress,
   } = props;
 
   return (
@@ -479,7 +495,7 @@ function HomeTab(props: {
             independent of font size at each breakpoint. */}
         <div
           aria-hidden
-          className="pointer-events-none absolute bottom-0 right-8 select-none font-clash text-[180px] font-bold leading-none text-white/[0.07] sm:text-[230px] md:text-[290px]"
+          className="pointer-events-none absolute bottom-0 right-8 select-none font-clash text-[140px] font-bold leading-none text-white/[0.07] sm:text-[180px] md:text-[230px]"
           style={{
             fontFamily: "'Clash Display', sans-serif",
             transform: "translateY(50%)",
@@ -488,11 +504,11 @@ function HomeTab(props: {
           .arc
         </div>
 
-        <div className="relative flex flex-col gap-5 p-5 sm:p-7 md:flex-row md:items-start md:justify-between md:gap-8 md:p-9">
+        <div className="relative flex flex-col gap-4 p-4 sm:p-6 md:flex-row md:items-start md:justify-between md:gap-6 md:p-7">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2 text-white/80">
               <span
-                className="font-clash text-base font-medium sm:text-lg"
+                className="font-clash text-sm font-medium sm:text-base"
                 style={{ fontFamily: "'Clash Display', sans-serif" }}
               >
                 Hi {displayName},
@@ -500,13 +516,13 @@ function HomeTab(props: {
               <CopyNameButton arcName={arcName} />
             </div>
 
-            <div className="mt-4 flex items-baseline gap-2">
+            <div className="mt-3 flex items-baseline gap-2">
               {balanceLoading && !intPart ? (
-                <div className="h-12 w-40 animate-pulse rounded-lg bg-white/10 sm:h-16 sm:w-56 md:h-20 md:w-72" />
+                <div className="h-10 w-32 animate-pulse rounded-lg bg-white/10 sm:h-12 sm:w-44 md:h-16 md:w-56" />
               ) : (
                 <>
                   <span
-                    className="font-clash text-5xl font-bold leading-none text-white sm:text-6xl md:text-7xl"
+                    className="font-clash text-4xl font-bold leading-none text-white sm:text-5xl md:text-6xl"
                     style={{
                       fontFamily: "'Clash Display', sans-serif",
                       letterSpacing: "-0.04em",
@@ -516,7 +532,7 @@ function HomeTab(props: {
                     <span className="text-white/90">.{fracPart}</span>
                   </span>
                   <span
-                    className="font-clash text-xl font-semibold text-white sm:text-2xl md:text-3xl"
+                    className="font-clash text-lg font-semibold text-white sm:text-xl md:text-2xl"
                     style={{ fontFamily: "'Clash Display', sans-serif" }}
                   >
                     USD
@@ -529,11 +545,13 @@ function HomeTab(props: {
                 greeting above, so we no longer duplicate it here. */}
           </div>
 
-          {/* QR tile — clickable, opens receive modal */}
+          {/* QR tile — clickable, opens the dedicated QR-only modal so
+              someone can scan the code at full size. The receive modal
+              (with copy/share actions) lives behind the Receive button. */}
           <button
-            onClick={onReceive}
-            aria-label="Open receive modal"
-            className="group relative h-24 w-24 shrink-0 self-end overflow-hidden rounded-2xl bg-white/95 p-1.5 transition hover:scale-[1.03] active:scale-100 sm:h-28 sm:w-28 md:h-32 md:w-32 md:self-start"
+            onClick={onShowQr}
+            aria-label="Show QR code"
+            className="group relative h-20 w-20 shrink-0 self-end overflow-hidden rounded-2xl bg-white/95 p-1.5 transition hover:scale-[1.03] active:scale-100 sm:h-24 sm:w-24 md:h-28 md:w-28 md:self-start"
           >
             {qrDataUrl ? (
               // eslint-disable-next-line @next/next/no-img-element
@@ -550,35 +568,37 @@ function HomeTab(props: {
       </section>
 
       {/* ── Action buttons row ── */}
-      <section className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+      {/* 4 columns at every viewport — all labels are single-word so they
+          fit even on a 320px screen without wrapping. */}
+      <section className="grid grid-cols-4 gap-2 sm:gap-3">
         <ActionBtn
-          icon={<Send size={20} />}
+          icon={<Send size={16} />}
           label="Send"
           onClick={onSend}
         />
         <ActionBtn
-          icon={<ArrowDownLeft size={20} />}
+          icon={<ArrowDownLeft size={16} />}
           label="Receive"
           onClick={onReceive}
         />
         <ActionBtn
-          icon={<HandCoins size={20} />}
+          icon={<HandCoins size={16} />}
           label="Request"
           onClick={onRequest}
         />
         <ActionBtn
-          icon={<CopyIcon size={18} />}
-          label={copiedAddress ? "Copied!" : "Copy Address"}
+          icon={<CopyIcon size={14} />}
+          label={copiedAddress ? "Copied" : "Copy"}
           onClick={onCopyAddress}
           highlight={copiedAddress}
         />
       </section>
 
       {/* ── Assets ── */}
-      <section className="rounded-3xl bg-[#0d2147] p-5 sm:p-6">
-        <div className="mb-4 flex items-baseline justify-between">
+      <section className="rounded-3xl bg-[#0d2147] p-4 sm:p-5">
+        <div className="mb-3 flex items-baseline justify-between">
           <h2
-            className="font-clash text-xl font-semibold text-white sm:text-2xl"
+            className="font-clash text-lg font-semibold text-white sm:text-xl"
             style={{ fontFamily: "'Clash Display', sans-serif" }}
           >
             Assets
@@ -696,7 +716,7 @@ function ActionBtn({
     <button
       onClick={onClick}
       className={
-        "flex flex-col items-center justify-center gap-1.5 rounded-2xl px-3 py-4 transition active:scale-[0.97] " +
+        "flex flex-col items-center justify-center gap-1 rounded-2xl px-2 py-3 transition active:scale-[0.97] " +
         (highlight
           ? "bg-white text-[#2563a6]"
           : "bg-[#4a82c8] text-white hover:bg-[#5590d4]")
@@ -705,7 +725,7 @@ function ActionBtn({
     >
       <span>{icon}</span>
       <span
-        className="font-clash text-xs font-semibold uppercase tracking-wider sm:text-[13px]"
+        className="font-clash whitespace-nowrap text-[10px] font-semibold uppercase tracking-wide sm:text-xs"
         style={{ fontFamily: "'Clash Display', sans-serif" }}
       >
         {label}
@@ -865,6 +885,7 @@ type AgentMessage = {
 
 type AgentStatus = {
   activated: boolean;
+  gated?: boolean;
   wallet?: { address: string; arcName: string | null; balanceUsdc: string };
   pinSet?: boolean;
   limits?: { max_per_transaction_usdc: number; max_daily_usdc: number; max_monthly_usdc: number };
@@ -1226,6 +1247,12 @@ function AgentTab({ arcName }: { arcName: string | null }) {
     );
   }
 
+  // Smart Agent is invite-only. Render the waitlist screen instead of
+  // the onboarding flow when the user's profile has not been granted access.
+  if (agentStatus?.gated) {
+    return <AgentGatedScreen />;
+  }
+
   const isActivated = onboardStep === "done";
 
   return (
@@ -1442,6 +1469,85 @@ function AgentPinInput({ onConfirm }: { onConfirm: (pin: string) => Promise<void
         </button>
       </div>
     </div>
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// AgentGatedScreen — invite-only waitlist screen
+// ────────────────────────────────────────────────────────────────────
+
+function AgentGatedScreen() {
+  return (
+    <section
+      className="flex flex-col rounded-3xl overflow-hidden"
+      style={{
+        background: "linear-gradient(160deg, #0d1f45 0%, #06122c 100%)",
+        minHeight: "calc(100dvh - 8rem)",
+      }}
+    >
+      <div className="flex items-center justify-between border-b border-white/10 px-5 py-3.5">
+        <div className="flex items-center gap-2.5">
+          <div className="flex h-7 w-7 items-center justify-center rounded-full bg-violet-500/20">
+            <Bot size={14} className="text-violet-300" />
+          </div>
+          <span className="font-clash text-sm font-semibold text-white">Smart Agent</span>
+          <span className="rounded-full bg-amber-500/15 px-2.5 py-0.5 text-[11px] font-medium text-amber-200">
+            Invite only
+          </span>
+        </div>
+      </div>
+
+      <div className="flex flex-1 flex-col items-center justify-center gap-7 px-6 py-16 text-center">
+        <div className="relative">
+          <div className="flex h-20 w-20 items-center justify-center rounded-2xl bg-violet-500/15">
+            <Bot size={36} className="text-violet-400" />
+          </div>
+          <div className="absolute -bottom-1 -right-1 flex h-8 w-8 items-center justify-center rounded-xl bg-[#06122c] ring-2 ring-amber-400/30">
+            <Lock size={14} className="text-amber-300" />
+          </div>
+        </div>
+
+        <div className="space-y-3 max-w-sm">
+          <h2 className="font-clash text-2xl font-semibold text-white">
+            Coming soon to your wallet
+          </h2>
+          <p className="text-sm leading-relaxed text-white/60">
+            Smart Agent runs on AI infrastructure that&apos;s expensive to operate.
+            We&apos;re rolling it out gradually to invited users while we scale.
+          </p>
+        </div>
+
+        <div className="w-full max-w-sm space-y-2 rounded-2xl border border-white/10 bg-white/[0.03] px-5 py-4 text-left">
+          <p className="text-xs font-semibold uppercase tracking-wide text-white/40">
+            What you&apos;ll get
+          </p>
+          <ul className="space-y-2 text-sm text-white/70">
+            <li className="flex items-start gap-2">
+              <Sparkles size={14} className="mt-0.5 shrink-0 text-violet-400" />
+              <span>Natural-language USDC payments</span>
+            </li>
+            <li className="flex items-start gap-2">
+              <Repeat size={14} className="mt-0.5 shrink-0 text-violet-400" />
+              <span>Recurring transfers and subscriptions</span>
+            </li>
+            <li className="flex items-start gap-2">
+              <Shield size={14} className="mt-0.5 shrink-0 text-violet-400" />
+              <span>PIN-secured spend limits</span>
+            </li>
+          </ul>
+        </div>
+
+        <p className="text-xs text-white/40">
+          Want early access? Reach out at{" "}
+          <a
+            href="mailto:hello@dotarc.my?subject=Smart%20Agent%20early%20access"
+            className="text-violet-300 underline-offset-2 hover:underline"
+          >
+            hello@dotarc.my
+          </a>
+        </p>
+      </div>
+    </section>
   );
 }
 
@@ -1684,6 +1790,17 @@ function PoliciesTab() {
 
       {loading ? (
         <div className="flex flex-1 items-center justify-center py-20"><Loader2 className="h-6 w-6 animate-spin text-white/40" /></div>
+      ) : status?.gated ? (
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 py-16 text-center">
+          <div className="relative">
+            <div className="rounded-full bg-violet-500/15 p-4"><Bot size={22} className="text-violet-400" /></div>
+            <div className="absolute -bottom-0.5 -right-0.5 flex h-6 w-6 items-center justify-center rounded-full bg-[#06122c] ring-2 ring-amber-400/30">
+              <Lock size={11} className="text-amber-300" />
+            </div>
+          </div>
+          <p className="text-sm font-medium text-white/70">Smart Agent is invite-only</p>
+          <p className="max-w-xs text-xs text-white/40">Policies will appear here once you have early access.</p>
+        </div>
       ) : !status?.activated ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 py-16 text-center">
           <div className="rounded-full bg-white/8 p-4"><Shield size={22} className="text-white/30" /></div>

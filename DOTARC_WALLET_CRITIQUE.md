@@ -183,7 +183,7 @@ Two parts of the doc disagree:
 If QR encodes `0x...`, scanning with a generic camera does nothing. If QR encodes the profile URL, wallet apps that expect EIP-681 can't auto-fill.
 
 **Required:**
-- QR encodes the **profile URL** (`https://wallet.dotarc.app/n/maya` or future custom domain).
+- QR encodes the **profile URL** (`https://wallet.dotarc.my/n/maya` or future custom domain).
 - The profile page sniffs the client:
   - Wallet deep-link / `eip681` query param → return EIP-681 address payload
   - Generic browser → render the pay-Maya landing page
@@ -365,7 +365,7 @@ These are decisions the owner must make **before** the engineer starts building.
 | Agent wallet `.arc` name | (a) register; (b) skip | (b) skip |
 | Recovery flow | Document Circle's exact behaviour | TBD — research required |
 | Bot protection on signup | Turnstile / phone / invite | All three at launch |
-| Subdomain or path | `wallet.dotarc.app` vs `dotarc.app/wallet` | Subdomain when domain is bought |
+| Subdomain or path | `wallet.dotarc.my` vs `dotarc.app/wallet` | Subdomain when domain is bought |
 
 ---
 

@@ -99,6 +99,7 @@ export const BridgeUsdc: SkillHandler = {
         .from("agent_spend_log")
         .insert({
           user_id:           supabaseUserId,
+          wallet_type:       "agent",
           skill:             "BRIDGE_USDC",
           recipient_address: toAddress,
           recipient_arc_name: String(params.toAddress ?? "").startsWith("0x")

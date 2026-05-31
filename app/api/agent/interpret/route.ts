@@ -12,7 +12,7 @@
  */
 
 import { NextResponse } from "next/server";
-import { requireAgentSession, getAgentAllBalances } from "@/lib/agent";
+import { requireAgentSession, enforceAgentGate, getAgentAllBalances } from "@/lib/agent";
 import { interpretInstruction } from "@/lib/agent-core";
 import type { AgentTokenBalance, AnyTaskResult } from "@/lib/agent-types";
 import { resolveRecipient } from "@/lib/ans";
@@ -26,6 +26,7 @@ export async function POST(req: Request) {
   let agentSession: Awaited<ReturnType<typeof requireAgentSession>>;
   try {
     agentSession = await requireAgentSession();
+    await enforceAgentGate(agentSession.supabaseUserId);
   } catch (res) {
     return res as Response;
   }

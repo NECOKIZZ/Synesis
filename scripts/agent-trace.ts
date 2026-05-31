@@ -68,7 +68,7 @@ async function main() {
 
   const apiKey = input.apiKey ?? process.env.OPENROUTER_API_KEY;
   const model = input.model ?? process.env.OPENROUTER_MODEL;
-  const referer = input.referer ?? process.env.NEXT_PUBLIC_APP_URL ?? "https://wallet.dotarc.app";
+  const referer = input.referer ?? process.env.NEXT_PUBLIC_APP_URL ?? "https://wallet.dotarc.my";
 
   if (!apiKey) {
     console.error("No OPENROUTER_API_KEY found. Provide it via env var or input.apiKey.");

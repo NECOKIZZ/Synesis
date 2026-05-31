@@ -453,7 +453,7 @@ export async function interpretInstruction(args: {
     args.model ?? process.env.OPENROUTER_MODEL ?? "anthropic/claude-3.5-sonnet";
 
   const livePrices = args.context.livePrices ?? await getLivePrices();
-  const referer = args.referer ?? process.env.NEXT_PUBLIC_APP_URL ?? "https://wallet.dotarc.app";
+  const referer = args.referer ?? process.env.NEXT_PUBLIC_APP_URL ?? "https://wallet.dotarc.my";
 
   const systemPrompt = buildSystemPrompt({ ...args.context, livePrices });
 
