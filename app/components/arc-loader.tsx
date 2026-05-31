@@ -42,11 +42,18 @@ export function ArcLoader({
   facts = DEFAULT_FACTS,
   className = "",
 }: ArcLoaderProps) {
-  const [factIndex, setFactIndex] = useState(
-    () => Math.floor(Math.random() * facts.length)
-  );
+  // Start at index 0 so server and client render the same first fact —
+  // randomizing in the initializer would cause a hydration mismatch
+  // (React #418), which nukes the whole tree on mount.
+  const [factIndex, setFactIndex] = useState(0);
   const [fade, setFade] = useState(true);
   const factsVisible = showFacts && size === "full";
+
+  // Pick a random starting fact AFTER mount (client-only).
+  useEffect(() => {
+    if (!factsVisible || facts.length <= 1) return;
+    setFactIndex(Math.floor(Math.random() * facts.length));
+  }, [factsVisible, facts.length]);
 
   useEffect(() => {
     if (!factsVisible || facts.length <= 1) return;

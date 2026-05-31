@@ -1289,7 +1289,11 @@ function AgentTab({ arcName }: { arcName: string | null }) {
             <div className="mx-auto flex w-full max-w-lg flex-1 flex-col items-center justify-center gap-6 px-5 py-12">
               <div className="flex items-center gap-3">
                 <Sparkles size={22} className="text-violet-400" />
-                <h2 className="font-clash text-2xl font-semibold text-white">Good {new Date().getHours() < 12 ? "morning" : new Date().getHours() < 18 ? "afternoon" : "evening"}, {firstName}</h2>
+                {/* suppressHydrationWarning: the time-of-day greeting depends on
+                    the user's local timezone, which the server can't know.
+                    Without this, React #418 fires and the whole tree (including
+                    the Circle PIN iframe ref) gets nuked on mount. */}
+                <h2 suppressHydrationWarning className="font-clash text-2xl font-semibold text-white">Good {new Date().getHours() < 12 ? "morning" : new Date().getHours() < 18 ? "afternoon" : "evening"}, {firstName}</h2>
               </div>
               <div className="flex flex-wrap justify-center gap-2">
                 {[

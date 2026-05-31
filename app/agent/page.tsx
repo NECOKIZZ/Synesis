@@ -639,7 +639,11 @@ function HomeGreeting({
           style={{ color: "#c25b3f" }}
           aria-hidden
         />
+        {/* suppressHydrationWarning: greeting is timezone-dependent and
+            differs between server (UTC) and client. Without this we trip
+            React #418 and the whole tree is regenerated on mount. */}
         <h1
+          suppressHydrationWarning
           className="text-3xl font-medium tracking-tight text-stone-800 sm:text-[2.5rem]"
           style={{
             fontFamily:
