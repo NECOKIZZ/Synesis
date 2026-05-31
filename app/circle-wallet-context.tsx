@@ -100,8 +100,20 @@ export function CircleWalletProvider({ children }: { children: React.ReactNode }
 
   useEffect(() => { refresh(); }, [refresh]);
 
-  const getSdk = useCallback(async () => {
-    if (sdkRef.current) return sdkRef.current;
+  /**
+   * Build a Circle W3S SDK instance.
+   *
+   * `fresh=true` forces a brand-new instance. We need this for every
+   * `executeChallenge` call because the SDK's internal iframe state goes
+   * stale after a `COMPLETE` challenge — re-using the same SDK for a
+   * second challenge causes the PIN dialog to silently never open
+   * (the user sees "Opening secure PIN entry…" forever).
+   *
+   * The cached instance is fine for the very first onboarding challenge,
+   * which is the only place we use `fresh=false`.
+   */
+  const getSdk = useCallback(async (fresh = false) => {
+    if (!fresh && sdkRef.current) return sdkRef.current;
     if (!CIRCLE_APP_ID) throw new Error("NEXT_PUBLIC_CIRCLE_APP_ID is not configured");
     const { W3SSdk } = await import("@circle-fin/w3s-pw-web-sdk");
     const sdk = new W3SSdk({ appSettings: { appId: CIRCLE_APP_ID } });
@@ -287,7 +299,9 @@ export function CircleWalletProvider({ children }: { children: React.ReactNode }
     userToken: string,
     encryptionKey: string
   ): Promise<{ txHash: string | null }> => {
-    const sdk = await getSdk();
+    // Force a fresh SDK instance — re-using a previously-executed instance
+    // makes the PIN dialog silently never open on second/subsequent calls.
+    const sdk = await getSdk(true);
     sdk.setAuthentication({ userToken, encryptionKey });
     return await new Promise<{ txHash: string | null }>((resolve, reject) => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
