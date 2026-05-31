@@ -435,8 +435,9 @@ export default function WalletPage() {
         <SendModal
           onClose={() => setShowSend(false)}
           onSent={async () => {
-            setShowSend(false);
-            await new Promise((r) => setTimeout(r, 2000));
+            // Don't close the modal here — the user needs to see the
+            // "Transaction submitted!" screen and click "Done". We just
+            // refresh the balance in the background.
             if (session?.walletAddress) {
               try {
                 const provider = new JsonRpcProvider(ARC_RPC_URL);

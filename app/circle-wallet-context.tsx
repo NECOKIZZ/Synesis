@@ -304,8 +304,14 @@ export function CircleWalletProvider({ children }: { children: React.ReactNode }
     const sdk = await getSdk(true);
     sdk.setAuthentication({ userToken, encryptionKey });
     return await new Promise<{ txHash: string | null }>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error("PIN confirmation timed out. Please try again."));
+      }, 60_000);
+
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       sdk.execute(challengeId, (err: any, result: any) => {
+        clearTimeout(timeout);
+        console.log("[circle] execute callback:", { err, result });
         if (err) {
           reject(new Error(err.message || err.code || "Challenge cancelled"));
           return;
@@ -324,6 +330,11 @@ export function CircleWalletProvider({ children }: { children: React.ReactNode }
           resolve({ txHash });
         } else if (result?.status === "FAILED" || result?.status === "ERROR") {
           reject(new Error(`Transaction ${result.status.toLowerCase()}`));
+        } else {
+          // Catch-all: Circle called back with an unrecognized status.
+          // Log it so we know what to handle next, then reject.
+          console.warn("[circle] unrecognized challenge status:", result?.status, result);
+          reject(new Error(`Unexpected status: ${result?.status || "unknown"}`));
         }
       });
     });
