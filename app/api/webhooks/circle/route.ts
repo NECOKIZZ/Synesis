@@ -51,6 +51,7 @@ type CircleTxState =
   | "SENT"
   | "CONFIRMED"
   | "COMPLETE"
+  | "CLEARED"
   | "DENIED"
   | "FAILED"
   | "CANCELLED";
@@ -227,16 +228,17 @@ async function refreshBalanceCache(
  * Map Circle's tx state onto our `agent_spend_log.status` vocabulary.
  */
 function statusFromState(state: CircleTxState): "PENDING" | "COMPLETE" | "FAILED" {
-  // Circle uses both CONFIRMED and COMPLETE as terminal-success in different
-  // wallet flavours; treat both as our COMPLETE status.
-  if (state === "CONFIRMED" || state === "COMPLETE") return "COMPLETE";
+  // Circle uses several terminal-success vocabularies depending on chain
+  // and wallet flavour: CONFIRMED (some EVMs), COMPLETE (some flows), and
+  // CLEARED (Arc Testnet). Treat all three as our COMPLETE status.
+  if (state === "CONFIRMED" || state === "COMPLETE" || state === "CLEARED") return "COMPLETE";
   if (state === "FAILED" || state === "CANCELLED" || state === "DENIED") return "FAILED";
   return "PENDING";
 }
 
 /** True when Circle's state means the on-chain tx settled successfully. */
 function isTerminalSuccess(state: CircleTxState): boolean {
-  return state === "CONFIRMED" || state === "COMPLETE";
+  return state === "CONFIRMED" || state === "COMPLETE" || state === "CLEARED";
 }
 
 /**
