@@ -47,8 +47,11 @@ const USDC_DECIMALS = 6;
 type CircleTxState =
   | "INITIATED"
   | "PENDING_RISK_SCREENING"
-  | "DENIED"
+  | "QUEUED"
+  | "SENT"
   | "CONFIRMED"
+  | "COMPLETE"
+  | "DENIED"
   | "FAILED"
   | "CANCELLED";
 
@@ -224,9 +227,16 @@ async function refreshBalanceCache(
  * Map Circle's tx state onto our `agent_spend_log.status` vocabulary.
  */
 function statusFromState(state: CircleTxState): "PENDING" | "COMPLETE" | "FAILED" {
-  if (state === "CONFIRMED") return "COMPLETE";
+  // Circle uses both CONFIRMED and COMPLETE as terminal-success in different
+  // wallet flavours; treat both as our COMPLETE status.
+  if (state === "CONFIRMED" || state === "COMPLETE") return "COMPLETE";
   if (state === "FAILED" || state === "CANCELLED" || state === "DENIED") return "FAILED";
   return "PENDING";
+}
+
+/** True when Circle's state means the on-chain tx settled successfully. */
+function isTerminalSuccess(state: CircleTxState): boolean {
+  return state === "CONFIRMED" || state === "COMPLETE";
 }
 
 /**
@@ -418,7 +428,7 @@ export async function POST(req: Request) {
   // 4. INBOUND confirmed: user (or their agent) received USDC.
   if (
     isInbound &&
-    state === "CONFIRMED" &&
+    isTerminalSuccess(state) &&
     notification.destinationAddress &&
     amountUsdc !== null
   ) {
@@ -440,7 +450,7 @@ export async function POST(req: Request) {
   // 5. OUTBOUND state change: confirm or fail an in-flight send.
   if (
     isOutbound &&
-    (state === "CONFIRMED" || state === "FAILED" || state === "CANCELLED" || state === "DENIED") &&
+    (isTerminalSuccess(state) || state === "FAILED" || state === "CANCELLED" || state === "DENIED") &&
     notification.sourceAddress &&
     amountUsdc !== null
   ) {
@@ -457,7 +467,7 @@ export async function POST(req: Request) {
       });
       // Only refresh cache on terminal states — PENDING webhooks would
       // pull a stale on-chain value and overwrite the cache for nothing.
-      if (state === "CONFIRMED" || state === "FAILED") {
+      if (isTerminalSuccess(state) || state === "FAILED") {
         await refreshBalanceCache(supabase, match);
       }
     }

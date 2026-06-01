@@ -54,39 +54,39 @@ export default function WalletPage() {
     try {
       const r = await fetch("/api/agent/status");
       const d = await r.json();
-      setAgentActivated(d.activated ?? false);
-      const rows: ActivityRow[] = Array.isArray(d.recentActivity)
+        setAgentActivated(d.activated ?? false);
+        const rows: ActivityRow[] = Array.isArray(d.recentActivity)
         ? d.recentActivity.map((row: {
-            id: string;
-            skill: string;
-            recipient_address?: string | null;
-            recipient_arc_name?: string | null;
-            amount_usdc: number | string;
-            tx_hash?: string | null;
-            status: string;
-            executed_at: string;
+              id: string;
+              skill: string;
+              recipient_address?: string | null;
+              recipient_arc_name?: string | null;
+              amount_usdc: number | string;
+              tx_hash?: string | null;
+              status: string;
+              executed_at: string;
           }) => ({
             id: row.id,
-            kind:
+              kind:
               row.skill === "WITHDRAW"
-                ? "WITHDRAW"
+                  ? "WITHDRAW"
                 : row.skill === "SEND_USDC" || row.skill === "AGENT_SEND"
-                  ? "SEND"
+                    ? "SEND"
                   : row.skill === "RECEIVE"
-                    ? "RECEIVE"
-                    : "OTHER",
+                      ? "RECEIVE"
+                      : "OTHER",
             counterparty: row.recipient_address ?? null,
             counterpartyArcName: row.recipient_arc_name ?? null,
             amountUsdc: Number(row.amount_usdc) || 0,
-            status:
+              status:
               row.status === "COMPLETE" || row.status === "PENDING" || row.status === "FAILED"
                 ? (row.status as ActivityRow["status"])
-                : "COMPLETE",
+                  : "COMPLETE",
             txHash: row.tx_hash ?? null,
             at: row.executed_at,
           }))
-        : [];
-      setActivity(rows);
+          : [];
+        setActivity(rows);
     } catch {
       setAgentActivated((prev) => prev ?? false);
     }
