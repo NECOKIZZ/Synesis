@@ -242,16 +242,18 @@ function isTerminalSuccess(state: CircleTxState): boolean {
 }
 
 /**
- * Insert (or update) the spend-log row for an outbound transfer.
+ * Insert (or update) an outbound transfer row.
  *
- * Matching strategy:
- *   1. By `circle_tx_id` — most reliable. Only hits on webhook re-delivery
- *      or if the row was created with the notification id ahead of time.
- *   2. Most recent PENDING row on the same user+wallet without a
- *      `circle_tx_id` yet — for sends initiated from our UI (skill code
- *      or send-modal) where we wrote a PENDING row at submit time.
- *   3. Insert a fresh row — for sends initiated outside the app (e.g.
- *      directly via Circle's API).
+ * Routes to the correct table:
+ *   - main wallet  → `wallet_transactions` (user-initiated send/withdraw)
+ *   - agent wallet → `agent_spend_log` (agent skill execution)
+ *
+ * Matching strategy (per table):
+ *   1. By `circle_tx_id` — idempotent re-delivery handler.
+ *   2. Most recent PENDING row with NULL `circle_tx_id` — claims rows
+ *      pre-inserted by send-prepare (main) or skill code (agent).
+ *   3. Otherwise insert a fresh row (only on terminal state, so we don't
+ *      litter logs with non-terminal rows we'd have to chase down).
  */
 async function recordOutbound(args: {
   supabase: SupabaseService;
@@ -265,7 +267,61 @@ async function recordOutbound(args: {
   const { supabase, match, state, notificationId, txHash, counterpartyAddress, amountUsdc } = args;
   const status = statusFromState(state);
 
-  // 1. Try by Circle tx id (idempotent re-delivery).
+  if (match.walletKind === "main") {
+    // ── Main wallet: wallet_transactions ─────────────────────────────
+    const { data: byCircleId } = await supabase
+      .from("wallet_transactions")
+      .select("id")
+      .eq("circle_tx_id", notificationId)
+      .maybeSingle();
+
+    if (byCircleId?.id) {
+      await supabase
+        .from("wallet_transactions")
+        .update({ status, tx_hash: txHash })
+        .eq("id", byCircleId.id);
+      return;
+    }
+
+    const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    const { data: candidates } = await supabase
+      .from("wallet_transactions")
+      .select("id")
+      .eq("user_id", match.userId)
+      .eq("direction", "SEND")
+      .eq("status", "PENDING")
+      .is("circle_tx_id", null)
+      .gte("executed_at", tenMinAgo)
+      .order("executed_at", { ascending: false })
+      .limit(1);
+
+    if (candidates && candidates.length > 0) {
+      await supabase
+        .from("wallet_transactions")
+        .update({ status, tx_hash: txHash, circle_tx_id: notificationId })
+        .eq("id", candidates[0].id);
+      return;
+    }
+
+    if (status !== "PENDING") {
+      const { error } = await supabase.from("wallet_transactions").insert({
+        user_id: match.userId,
+        direction: "SEND",
+        counterparty_address: counterpartyAddress,
+        amount: amountUsdc,
+        token_symbol: "USDC",
+        tx_hash: txHash,
+        circle_tx_id: notificationId,
+        status,
+      });
+      if (error && error.code !== "23505") {
+        console.error("[webhooks/circle] outbound (main) insert failed:", error);
+      }
+    }
+    return;
+  }
+
+  // ── Agent wallet: agent_spend_log ──────────────────────────────────
   const { data: byCircleId } = await supabase
     .from("agent_spend_log")
     .select("id")
@@ -280,13 +336,12 @@ async function recordOutbound(args: {
     return;
   }
 
-  // 2. Try to find a recent PENDING row this webhook is the resolution for.
   const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
   const { data: candidates } = await supabase
     .from("agent_spend_log")
     .select("id")
     .eq("user_id", match.userId)
-    .eq("wallet_type", match.walletKind)
+    .eq("wallet_type", "agent")
     .eq("status", "PENDING")
     .is("circle_tx_id", null)
     .gte("executed_at", tenMinAgo)
@@ -306,14 +361,11 @@ async function recordOutbound(args: {
     return;
   }
 
-  // 3. Last resort: insert a brand-new row. Only do this for terminal
-  // states — we don't want to litter the log with an INITIATED row that
-  // we'd then have to chase down later.
   if (status !== "PENDING") {
     await supabase.from("agent_spend_log").insert({
       user_id: match.userId,
-      wallet_type: match.walletKind,
-      skill: match.walletKind === "agent" ? "AGENT_SEND" : "SEND_USDC",
+      wallet_type: "agent",
+      skill: "AGENT_SEND",
       recipient_address: counterpartyAddress,
       amount_usdc: amountUsdc,
       tx_hash: txHash,
@@ -325,9 +377,11 @@ async function recordOutbound(args: {
 }
 
 /**
- * Insert a RECEIVE row for a confirmed inbound transfer. The unique
- * partial index on `idempotency_key` guarantees a redelivered webhook
- * won't double-insert.
+ * Insert a RECEIVE row for a confirmed inbound transfer.
+ *
+ * Routes to wallet_transactions for the main wallet, agent_spend_log for
+ * the agent wallet. Idempotent re-delivery handled by the unique partial
+ * index on `circle_tx_id`.
  */
 async function recordInbound(args: {
   supabase: SupabaseService;
@@ -339,21 +393,36 @@ async function recordInbound(args: {
 }): Promise<void> {
   const { supabase, match, notificationId, txHash, senderAddress, amountUsdc } = args;
 
+  if (match.walletKind === "main") {
+    const { error } = await supabase.from("wallet_transactions").insert({
+      user_id: match.userId,
+      direction: "RECEIVE",
+      counterparty_address: senderAddress,
+      amount: amountUsdc,
+      token_symbol: "USDC",
+      tx_hash: txHash,
+      circle_tx_id: notificationId,
+      status: "COMPLETE",
+    });
+    if (error && error.code !== "23505") {
+      console.error("[webhooks/circle] inbound (main) insert failed:", error);
+    }
+    return;
+  }
+
   const { error } = await supabase.from("agent_spend_log").insert({
     user_id: match.userId,
-    wallet_type: match.walletKind,
+    wallet_type: "agent",
     skill: "RECEIVE",
-    recipient_address: senderAddress, // for inbound, this slot holds the SENDER
+    recipient_address: senderAddress,
     amount_usdc: amountUsdc,
     tx_hash: txHash,
     circle_tx_id: notificationId,
     idempotency_key: notificationId,
     status: "COMPLETE",
   });
-
-  // Postgres unique_violation = 23505. Re-deliveries hit this and that's fine.
   if (error && error.code !== "23505") {
-    console.error("[webhooks/circle] inbound insert failed:", error);
+    console.error("[webhooks/circle] inbound (agent) insert failed:", error);
   }
 }
 

@@ -52,6 +52,10 @@ export type Tab = "home" | "activity" | "agent" | "policies";
 
 export interface ActivityRow {
   id: string;
+  // Which wallet this row belongs to. The Activity tab merges main wallet
+  // and (when invited) agent wallet rows into a single timeline; the
+  // badge tells the user where each came from.
+  source?: "wallet" | "agent";
   kind: "SEND" | "RECEIVE" | "WITHDRAW" | "OTHER";
   counterparty?: string | null;
   counterpartyArcName?: string | null;
@@ -817,7 +821,7 @@ function ActivityRowItem({ row }: { row: ActivityRow }) {
         </div>
 
         <div className="min-w-0 flex-1">
-          {/* Row 1: direction · amount · arc name */}
+          {/* Row 1: direction · amount · arc name · source badge */}
           <div className="flex items-center gap-1.5 flex-wrap">
             <span className="text-sm font-semibold text-white">{directionLabel}</span>
             <span className={`text-sm font-semibold ${amountColor}`}>
@@ -828,6 +832,18 @@ function ActivityRowItem({ row }: { row: ActivityRow }) {
                 <span className="text-white/30 text-xs">→</span>
                 <span className="text-xs font-medium text-blue-300">{counterpartyDisplay}</span>
               </>
+            )}
+            {/* Source badge — distinguishes main wallet rows from agent
+                rows in the unified feed. Default to wallet for legacy
+                rows that lack a source field. */}
+            {row.source === "agent" ? (
+              <span className="rounded-full bg-purple-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-purple-300">
+                agent
+              </span>
+            ) : (
+              <span className="rounded-full bg-blue-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-blue-300">
+                wallet
+              </span>
             )}
             {statusBadge && (
               <span className={`rounded-full px-1.5 py-0.5 text-[10px] font-medium ${statusBadge}`}>

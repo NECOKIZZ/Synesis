@@ -48,45 +48,60 @@ export default function WalletPage() {
   const [activity, setActivity] = useState<ActivityRow[]>([]);
   const [activeTab, setActiveTab] = useState<Tab>("home");
 
-  // Reusable loader — called on mount AND whenever a webhook-driven row
-  // change comes in via Supabase Realtime.
+  // Reusable loader — pulls the unified activity feed (main wallet +
+  // agent wallet, merged) AND the agent activation flag. Called on mount
+  // and whenever a realtime row change comes in.
   const loadAgentStatus = useCallback(async () => {
+    // Activity feed — runs even for non-invited (non-agent) users so the
+    // main wallet's sends/receives still surface. Endpoint is dedicated
+    // to the Activity tab and not gated by the Smart Agent invite system.
     try {
-      const r = await fetch("/api/agent/status");
-      const d = await r.json();
-        setAgentActivated(d.activated ?? false);
-        const rows: ActivityRow[] = Array.isArray(d.recentActivity)
-        ? d.recentActivity.map((row: {
+      const r = await fetch("/api/wallet/activity");
+      if (r.ok) {
+        const d = await r.json();
+        const rows: ActivityRow[] = Array.isArray(d.activity)
+          ? d.activity.map((row: {
               id: string;
-              skill: string;
-              recipient_address?: string | null;
-              recipient_arc_name?: string | null;
-              amount_usdc: number | string;
-              tx_hash?: string | null;
+              source: "wallet" | "agent";
+              kind: ActivityRow["kind"];
+              counterpartyAddress: string | null;
+              counterpartyArcName: string | null;
+              amount: number | string;
+              tokenSymbol: string;
+              txHash: string | null;
               status: string;
-              executed_at: string;
-          }) => ({
-            id: row.id,
-              kind:
-              row.skill === "WITHDRAW"
-                  ? "WITHDRAW"
-                : row.skill === "SEND_USDC" || row.skill === "AGENT_SEND"
-                    ? "SEND"
-                  : row.skill === "RECEIVE"
-                      ? "RECEIVE"
-                      : "OTHER",
-            counterparty: row.recipient_address ?? null,
-            counterpartyArcName: row.recipient_arc_name ?? null,
-            amountUsdc: Number(row.amount_usdc) || 0,
+              executedAt: string;
+            }) => ({
+              id: row.id,
+              source: row.source,
+              kind: row.kind,
+              counterparty: row.counterpartyAddress ?? null,
+              counterpartyArcName: row.counterpartyArcName ?? null,
+              amountUsdc: Number(row.amount) || 0,
               status:
-              row.status === "COMPLETE" || row.status === "PENDING" || row.status === "FAILED"
-                ? (row.status as ActivityRow["status"])
+                row.status === "COMPLETE" || row.status === "PENDING" || row.status === "FAILED"
+                  ? (row.status as ActivityRow["status"])
                   : "COMPLETE",
-            txHash: row.tx_hash ?? null,
-            at: row.executed_at,
-          }))
+              txHash: row.txHash ?? null,
+              at: row.executedAt,
+            }))
           : [];
         setActivity(rows);
+      }
+    } catch {
+      // Network / parsing failures: keep whatever activity was already
+      // rendered so the UI doesn't blink to empty on transient errors.
+    }
+
+    // Agent activation flag — separate concern; this endpoint is gated.
+    try {
+      const r = await fetch("/api/agent/status");
+      if (r.ok) {
+        const d = await r.json();
+        setAgentActivated(d.activated ?? false);
+      } else {
+        setAgentActivated((prev) => prev ?? false);
+      }
     } catch {
       setAgentActivated((prev) => prev ?? false);
     }
@@ -107,6 +122,16 @@ export default function WalletPage() {
 
     const channel = supabase
       .channel(`wallet-live-${session.userId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "wallet_transactions",
+          filter: `user_id=eq.${session.userId}`,
+        },
+        () => { loadAgentStatus(); }
+      )
       .on(
         "postgres_changes",
         {

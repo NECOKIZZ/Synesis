@@ -183,26 +183,28 @@ export async function POST(req: Request) {
       challengeId: prepared.challengeId,
     });
 
-    // Log to agent_spend_log as PENDING so the activity tab shows manual sends.
-    // Best-effort: never block the send if this fails — but log loudly so we
-    // can debug RLS / column-mismatch issues server-side.
+    // Log to wallet_transactions as PENDING so the activity tab shows
+    // manual sends from the main wallet. Best-effort: never block the send
+    // if this fails, but log loudly so RLS / column-mismatch issues are
+    // visible in Vercel logs.
     try {
       const supabase = await createSupabaseServerClient();
       const { data: { user }, error: authErr } = await supabase.auth.getUser();
       if (authErr || !user?.id) {
         console.error("[send-prepare] activity log skipped: no user", { authErr, hasUser: !!user });
       } else {
-        const { error: insertErr } = await supabase.from("agent_spend_log").insert({
+        const { error: insertErr } = await supabase.from("wallet_transactions").insert({
           user_id: user.id,
-          skill: "SEND_USDC",
-          recipient_address: resolvedAddress,
-          recipient_arc_name: resolvedName,
-          amount_usdc: parseFloat(amount),
+          direction: "SEND",
+          counterparty_address: resolvedAddress,
+          counterparty_arc_name: resolvedName,
+          amount: amount,
+          token_symbol: "USDC",
           status: "PENDING",
-          // wallet_type defaults to 'main' per migration 0007.
-          // Don't write circle_tx_id here — Circle's webhook arrives with a
-          // different notification.id, and our matcher looks for circle_tx_id
-          // IS NULL to claim recent PENDING rows.
+          // Don't write circle_tx_id here. Circle's webhook arrives with
+          // notification.id (a different value than the challengeId we
+          // have right now). The webhook's claim-PENDING matcher looks
+          // for circle_tx_id IS NULL to claim recently inserted rows.
         });
         if (insertErr) {
           console.error("[send-prepare] activity log insert failed:", insertErr);
