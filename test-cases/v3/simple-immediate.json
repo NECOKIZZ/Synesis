@@ -1,0 +1,17 @@
+{
+  "instruction": "send 5 USDC to alice.arc",
+  "context": {
+    "limits": {
+      "max_per_transaction_usdc": 100,
+      "max_daily_usdc": 500,
+      "max_weekly_usdc": 2000,
+      "max_monthly_usdc": 5000
+    },
+    "agentBalanceUsdc": "50.00",
+    "activePolicies": [],
+    "allBalances": [
+      { "symbol": "USDC", "amount": "50.00", "approxUsdValue": 50 }
+    ],
+    "livePrices": { "eurcUsdc": 1.08, "cirBtcUsdc": 100000 }
+  }
+}

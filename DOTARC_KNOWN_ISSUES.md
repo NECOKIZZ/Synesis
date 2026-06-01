@@ -1,7 +1,8 @@
 # DotArc — Known Issues & Architectural Debt
 
 > Documented: 2026-05-27  
-> Status: Open items tracked below. Closed items noted with ✅ fix date.
+> Last updated: 2026-06-01  
+> Status: Open items tracked below. Closed items removed once verified in production.
 
 ---
 
@@ -59,48 +60,15 @@ task_type: "compound" | "simple"
 
 ---
 
-## 3. Main Wallet Activity Not Captured
+<!-- Issue 3 (Main Wallet Activity Not Captured) FIXED 2026-06-01.
+     Path B implemented: new wallet_transactions table (migration 0008),
+     send-prepare writes PENDING rows, Circle webhook claims them on
+     CLEARED state. Activity tab unifies wallet_transactions and
+     agent_spend_log via /api/wallet/activity. -->
 
-**Problem:** The Activity tab only shows `agent_spend_log` rows. Main wallet transactions (sends via SendModal) and ALL receives are invisible.
 
-**Evidence:**
-- `app/wallet/page.tsx` fetches `/api/agent/status` → maps `recentActivity` from `agent_spend_log` only.
-- `app/wallet/send-modal.tsx` executes via Circle SDK in browser; nothing hits backend.
-- No incoming transfer listener for either wallet.
+<!-- Issue 4 (Agent Partial Balance Prompt) FIXED 2026-05-27. -->
 
-**Gap table:**
-
-| Transaction Type | Logged? | Source |
-|------------------|---------|--------|
-| Agent SEND_USDC  | ✅ Yes  | `agent_spend_log` |
-| Agent WITHDRAW   | ✅ Yes  | `agent_spend_log` |
-| Agent SWAP       | ✅ Yes  | `agent_spend_log` |
-| Main wallet Send | ❌ No   | Browser SDK only |
-| Any Receive      | ❌ No   | Not captured |
-
-**Fix options:**
-- **Path A:** On-chain polling via RPC (Transfer events). No backend needed. Works for sends + receives.
-- **Path B:** New `wallet_transactions` table. Log sends after Circle challenge. Poll RPC for receives.
-
-**Status:** Documented. User requested to defer fix.
-
----
-
-## 4. Agent Partial Balance Prompt Deficiency (FIXED ✅ 2026-05-27)
-
-**Problem:** LLM swapped full token amounts even when the wallet held partial balances. Example: wallet has 3 EURC, user wants to send 5 EURC → LLM tried to swap 5 EURC worth of USDC, ignoring the existing 3.
-
-**Root cause:** System prompt lacked explicit stepwise logic for partial balance calculation.
-
-**Fix applied:** Rewrote `SMART BALANCE INFERENCE` section in `lib/agent-core.ts`:
-- Added explicit shortfall calculation: `shortfall = amount_needed - existing_balance`
-- Added rule: swap only shortfall (+ slippage), never full amount
-- Added critical warning: "Do NOT ignore the existing balance"
-
-**Validation:**
-- `test-cases/send-cryptolympus-eurc-partial.json` — passes, returns correct shortfall swap amount
-
----
 
 ## 5. Time Constraints Silently Dropped in Compound Tasks
 
@@ -116,30 +84,14 @@ task_type: "compound" | "simple"
 
 ---
 
-## 6. Main Wallet Only Showed USDC (FIXED ✅ 2026-05-27)
+<!-- Issue 6 (Main Wallet Only Showed USDC) FIXED 2026-05-27. -->
 
-**Problem:** Assets section hardcoded USDC only. EURC and cirBTC balances were invisible.
 
-**Fix applied:**
-- `app/wallet/page.tsx` — fetches all configured tokens in parallel via public RPC
-- `app/wallet/wallet-shell.tsx` — dynamic `TokenRow` rendering with token-specific styling
-- `.env.local` / `.env.example` — added `NEXT_PUBLIC_EURC_TOKEN_ADDRESS` and `NEXT_PUBLIC_CIRBTC_TOKEN_ADDRESS`
+<!-- Issue 7 (Activity Page Incomplete) FIXED 2026-06-01.
+     Same fix as Issue 3 — unified feed via /api/wallet/activity merges
+     main wallet rows (wallet_transactions) with agent rows
+     (agent_spend_log) and badges each by source. -->
 
-**Limitation:** EURC works (address from App Kit). cirBTC still needs official address.
-
----
-
-## 7. Activity Page Shows Agent Log Only, No Full History
-
-**Problem:** The Activity tab is labeled "Recent" but only surfaces agent actions. Users expect to see ALL transactions — main wallet sends, receives, agent actions.
-
-**Evidence:**
-- Empty-state text says: *"Send or receive USDC and your transactions will appear here."*
-- But receives never appear. Main wallet sends never appear.
-
-**Status:** Same as Issue #3 — deferred.
-
----
 
 ## 8. Agent Confirm-Policy Endpoint Logging Overgrowth
 
@@ -155,46 +107,34 @@ task_type: "compound" | "simple"
 
 ---
 
-## Summary Table
+## Summary Table (Open items only)
 
 | # | Issue | Severity | Status |
 |---|-------|----------|--------|
 | 1 | Missing cirBTC address | Medium | Blocked (need Circle) |
 | 2 | Flat task type hierarchy | Medium | Acknowledged, deferred |
-| 3 | Main wallet / receive logs missing | High | Deferred |
-| 4 | Partial balance prompt bug | High | ✅ Fixed |
 | 5 | Time constraints dropped | Medium | Blocked by #2 |
-| 6 | USDC-only Assets display | Medium | ✅ Fixed |
-| 7 | Activity tab incomplete | High | Deferred (same as #3) |
 | 8 | Debug logging cleanup | Low | Pre-production task |
-| 9 | OTP infinite retry loop on auth failure | **Critical** | ✅ Fixed (redeploy after adding NEXT_PUBLIC_APP_URL) |
-| 10 | Supabase email template mismatch (magic link vs 6-digit code) | **Critical** | Needs Supabase dashboard fix |
+| 9 | Auth loop-prevention hardening | High | Open |
+| 10 | Supabase email template mismatch | Critical | Needs Supabase dashboard fix |
 | 11 | Mobile layout / send button breakpoint | Medium | Open |
-| 12 | Ineffective responsiveness (layout breakpoints) | Medium | Open |
-| 13 | Onboarding flow breaks on CSRF / custom domain | **Critical** | ✅ Fixed (same as #9) |
-| 14 | Loading buttons feel ineffective (local dev latency) | Low | Environment, not code |
-| 15 | Inadequate error handling coverage | **Critical** | Open |
-| 16 | Agent wallet needs invite-only gating | **Critical** | Planned |
+| 12 | Ineffective responsiveness (breakpoints) | Medium | Open |
+| 14 | Loading buttons feel ineffective (local) | Low | Environment, not code |
+| 15 | Inadequate error handling coverage | Critical | Open |
+| 17 | Send modal: no tx hash returned by Circle SDK → "View transaction" button missing | Medium | Open |
+| 18 | Send modal: no completion sound + entrance animation | Low | Open |
 
 ---
 
-## 9. OTP Infinite Retry Loop on Auth Failure
+## 9. OTP Auth-Failure Loop — Resilience Guard Still Needed
 
-**Problem:** When `/api/circle/init-user` returns 403 (CSRF middleware rejects custom domain), the error screen shows "Try again" and "Sign out and start over". Clicking "Sign out" triggers `logout()` which POSTs to `/api/circle/logout` — also 403'd by CSRF middleware. The catch block swallows the error, frontend sets `status = "anonymous"`, `AuthGate` remounts, its mount effect detects the still-live Supabase session (server-side `signOut` never ran), and auto-calls `onVerified` again → infinite loop of `init-user` → 403 → error → logout → remount.
+**Problem:** The original CSRF-induced 403 loop is fixed (deploy with `NEXT_PUBLIC_APP_URL` set, plus webhook routes now exempt from CSRF). But the underlying race — `AuthGate` remount detects the still-live Supabase session and auto-fires `onVerified` again — is still possible if any server endpoint starts returning 403 unexpectedly.
 
-**Root cause:** `AuthGate` mount effect (`auth-gate.tsx:43-80`) uses `firedRef` but resets on every remount. `logout` doesn't clear the browser-side Supabase session, only the server-side cookie.
-
-**Evidence:** Vercel logs showed 8+ rapid-fire requests: `init-user` 403 → `logout` 403 → `init-user` 403 → repeat.
-
-**Fix applied (code):** 
-- Added `NEXT_PUBLIC_APP_URL=https://wallet.dotarc.my` to Vercel env vars
-- Redeployed so `middleware.ts` `buildAllowedOrigins()` includes the custom domain
-
-**Fix still needed (code):**
-- Make `logout()` in `circle-wallet-context.tsx` call `supabase.auth.signOut()` client-side too, so `AuthGate` mount effect finds no session on next remount
+**Fix needed (code):**
+- `logout()` in `circle-wallet-context.tsx` should call `supabase.auth.signOut()` client-side so `AuthGate` finds no session on remount
 - Or add a `signOutAttempted` flag to `AuthGate` to skip auto-detection once
 
-**Status:** CSRF issue ✅ fixed by redeploy. Loop-prevention guard still needed for resilience.
+**Status:** Original CSRF symptom fixed. Loop-prevention hardening still pending.
 
 ---
 
@@ -245,17 +185,10 @@ task_type: "compound" | "simple"
 
 ---
 
-## 13. Onboarding Flow Breaks on CSRF / Custom Domain
+<!-- Issue 13 (Onboarding CSRF) FIXED. Resolved by setting
+     NEXT_PUBLIC_APP_URL on Vercel and redeploying. Webhook routes are
+     now also explicitly exempt from the CSRF gate via middleware.ts. -->
 
-**Problem:** Same root cause as Issue #9. When `NEXT_PUBLIC_APP_URL` doesn't match the actual deployed domain, the entire onboarding flow — email OTP, Google OAuth callback, PIN setup, wallet creation — is blocked by middleware returning 403.
-
-**Impact:** New users can't sign up. Returning users can't sign in. App is completely unusable.
-
-**Fix:** See Issue #9. Ensure `NEXT_PUBLIC_APP_URL` is always set to the canonical domain before any deploy.
-
-**Status:** ✅ Fixed by redeploy with correct env var.
-
----
 
 ## 14. Loading Buttons Feel Ineffective (Local Dev Latency)
 
@@ -310,34 +243,48 @@ task_type: "compound" | "simple"
 
 ---
 
-## 16. Agent Wallet Needs Invite-Only Gating
+<!-- Issue 16 (Agent Invite Gating) FIXED 2026-05-30. Migration 0006 added
+     `agent_enabled` to profiles, isAgentEnabled() gates /api/agent/status
+     and dependent routes, WalletShell renders the locked state for
+     non-invited users. To grant access:
+       update public.profiles set agent_enabled = true where email = '...'; -->
 
-**Problem:** The Smart Agent feature (OpenRouter LLM calls, policy execution, agent wallet creation) is expensive to operate at scale. Without a gate, 1,000+ daily users would drain OpenRouter credits and Circle API rate limits. The product strategy is to ship the main wallet first, build traction, then slowly roll out agent access to invited users as funds allow.
 
-**Why:**
-- Every chat message hits OpenRouter (paid per token)
-- Agent wallet creation uses Circle dev-controlled wallets (paid)
-- Policy execution burns API calls + on-chain gas
-- Main wallet (Circle user-controlled + public RPC) costs ~$0 per user
+---
 
-**Proposed implementation (minimal viable gate):**
-1. Add `agent_enabled BOOLEAN DEFAULT false` to `profiles` table
-2. Gate `/agent` page — redirect non-enabled users to `/wallet` with toast
-3. Gate Smart Agent card in `WalletShell` — show lock icon + "Join waitlist"
-4. Gate all `/api/agent/*` routes — return 403 if `agent_enabled = false`
-5. Manually flip `agent_enabled = true` in Supabase dashboard for early invitees
+## 17. Send Modal — "View Transaction" Button Missing After Send
 
-**Why not an invite code system yet:**
-- Invite codes require a whole feature: code table, validation UI, admin dashboard, code generation
-- Manual Supabase toggle is 5 minutes per user, zero code to write
-- Can graduate to auto-invite codes once product-market fit is proven
+**Problem:** After a successful send, the Done step in `send-modal.tsx` only shows the "Close" button. The intended "View transaction" button (which links to Arc Explorer with the tx hash) is conditionally rendered only when `txHash` is non-null, and Circle's W3S browser SDK does not consistently return `txHash` in its `onComplete` callback on Arc Testnet — the hash arrives later via webhook.
 
-**Files to change when implemented:**
-- `supabase/migrations/` — add `agent_enabled` column to `profiles`
-- `app/wallet/page.tsx` — pass `agentEnabled` flag to `WalletShell`
-- `app/wallet/wallet-shell.tsx` — render locked state for Smart Agent card
-- `app/agent/page.tsx` — server-side redirect if not enabled
-- `app/api/agent/*` — all routes check `agent_enabled` on the authenticated profile
-- `lib/profile.ts` — fetch `agent_enabled` alongside existing profile fields
+**Evidence:**
+- `app/circle-wallet-context.tsx:325-329` — `executeChallenge` falls through multiple field paths (`data.txHash`, `data.transactionHash`, `result.txHash`) and resolves `null` if none match.
+- `app/wallet/send-modal.tsx:449` — the "View transaction" anchor is wrapped in `{txHash && (...)}`, so when null nothing renders.
+- The webhook DOES populate `tx_hash` on the corresponding `wallet_transactions` row ~2-3s after the send, but the modal has already closed by then.
 
-**Status:** Planned. Blocked until main wallet traction is established.
+**Fix options:**
+- **Path A:** After Circle SDK returns null, poll the `wallet_transactions` row via Supabase realtime for ~5s waiting for the webhook to populate `tx_hash`, then enable the button.
+- **Path B:** Always show the button — link to the wallet's address page on the explorer when the hash is missing (less satisfying but never empty).
+- **Path C:** Log Circle's raw `result` object server-side or in a dev console to confirm whether the hash is actually present under a field name we missed (e.g., `id`, `transactionId`).
+
+**Recommendation:** Path C first (1 line of `console.log`), then Path A if the hash truly isn't surfaced.
+
+**Status:** Open. Activity tab DOES eventually show the hash for the row, so users can find it — but the modal experience is degraded.
+
+---
+
+## 18. Send Modal — No Sound + No Entrance Animation
+
+**Problem:** The send modal pops in instantly with no transition and gives no audio feedback on success. Compared with native banking apps (and the bar set by the rest of the DotArc UI), this feels abrupt.
+
+**Wanted:**
+- **Entrance animation:** modal slides up + fades in over ~250ms with a subtle backdrop blur ramp (matches the existing bottom-sheet pattern on mobile).
+- **Step transitions:** soft cross-fade between input → preparing → confirm → signing → done; the current hard cuts are jarring.
+- **Success sound:** quiet, tasteful "ka-ching" / chime on the Done step (mute-aware — respect `prefers-reduced-motion` and don't play if the page tab is hidden).
+- **Failure sound:** soft "thud" or descending tone on the Failed step.
+
+**Files to touch:**
+- `app/wallet/send-modal.tsx` — add framer-motion entrance / step transitions
+- `public/sounds/` — add `success.mp3` + `fail.mp3` (small, royalty-free)
+- New utility `lib/sound.ts` — preload + mute-aware playback wrapper
+
+**Status:** Open. Polish, not blocking.

@@ -1,0 +1,17 @@
+{
+  "instruction": "every Tuesday if my balance is above 70 USDC, send 50 USDC to maya",
+  "context": {
+    "limits": {
+      "max_per_transaction_usdc": 100,
+      "max_daily_usdc": 500,
+      "max_weekly_usdc": 2000,
+      "max_monthly_usdc": 5000
+    },
+    "agentBalanceUsdc": "100.00",
+    "activePolicies": [],
+    "allBalances": [
+      { "symbol": "USDC", "amount": "100.00", "approxUsdValue": 100 }
+    ],
+    "livePrices": { "eurcUsdc": 1.08, "cirBtcUsdc": 100000 }
+  }
+}
