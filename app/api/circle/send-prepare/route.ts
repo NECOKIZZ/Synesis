@@ -184,22 +184,32 @@ export async function POST(req: Request) {
     });
 
     // Log to agent_spend_log as PENDING so the activity tab shows manual sends.
-    // Best-effort: never block the send if this fails.
+    // Best-effort: never block the send if this fails — but log loudly so we
+    // can debug RLS / column-mismatch issues server-side.
     try {
       const supabase = await createSupabaseServerClient();
-      const { data: { user } } = await supabase.auth.getUser();
-      if (user?.id) {
-        await supabase.from("agent_spend_log").insert({
+      const { data: { user }, error: authErr } = await supabase.auth.getUser();
+      if (authErr || !user?.id) {
+        console.error("[send-prepare] activity log skipped: no user", { authErr, hasUser: !!user });
+      } else {
+        const { error: insertErr } = await supabase.from("agent_spend_log").insert({
           user_id: user.id,
           skill: "SEND_USDC",
           recipient_address: resolvedAddress,
+          recipient_arc_name: resolvedName,
           amount_usdc: parseFloat(amount),
           status: "PENDING",
-          circle_tx_id: prepared.challengeId,
+          // wallet_type defaults to 'main' per migration 0007.
+          // Don't write circle_tx_id here — Circle's webhook arrives with a
+          // different notification.id, and our matcher looks for circle_tx_id
+          // IS NULL to claim recent PENDING rows.
         });
+        if (insertErr) {
+          console.error("[send-prepare] activity log insert failed:", insertErr);
+        }
       }
-    } catch {
-      // non-fatal
+    } catch (logErr) {
+      console.error("[send-prepare] activity log threw:", logErr);
     }
 
     return NextResponse.json({
