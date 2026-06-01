@@ -197,7 +197,7 @@ export function SendModal({ onClose, onSent }: SendModalProps) {
         {/* ── Header */}
         <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
           <h3 className="text-base font-semibold text-white">
-            {step === "confirm" ? "Confirm send" : step === "done" ? "Sent!" : "Send USDC"}
+            {step === "confirm" ? "Confirm send" : step === "done" ? "Done" : "Send USDC"}
           </h3>
           {step !== "preparing" && step !== "signing" && (
             <button
@@ -433,7 +433,7 @@ export function SendModal({ onClose, onSent }: SendModalProps) {
                   <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
                 </svg>
               </div>
-              <p className="font-semibold text-white">Transaction submitted!</p>
+              <p className="font-semibold text-white">Transaction done</p>
               {prepared && (
                 <p className="mt-1 text-sm text-white/50">
                   {formatUsdc(prepared.amount)} USDC →{" "}
@@ -441,27 +441,31 @@ export function SendModal({ onClose, onSent }: SendModalProps) {
                 </p>
               )}
               <p className="mt-2 text-xs text-white/30">
-                Your balance will update once confirmed on Arc Testnet.
+                Settled on Arc Testnet. Your balance will refresh in a moment.
               </p>
-              {/* Only render the explorer link when we have a real tx hash;
-                  a base-URL link without a hash lands on the explorer
-                  homepage and feels broken. */}
-              {txHash && (
-                <a
-                  href={`${ARC_EXPLORER}${txHash}`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="mt-3 inline-block text-xs text-blue-400 hover:underline"
+              <div className="mt-5 flex gap-2">
+                {/* Tx hash button — only renders when Circle returned a hash.
+                    Without it the explorer URL lands on the homepage. */}
+                {txHash && (
+                  <a
+                    href={`${ARC_EXPLORER}${txHash}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl border border-white/15 px-4 py-2.5 text-sm font-medium text-white/80 transition hover:bg-white/10 hover:text-white"
+                  >
+                    <span className="font-mono text-xs">{shortAddr(txHash)}</span>
+                    <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                    </svg>
+                  </a>
+                )}
+                <button
+                  onClick={onClose}
+                  className="flex-1 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-blue-500"
                 >
-                  View on Arc Explorer →
-                </a>
-              )}
-              <button
-                onClick={onClose}
-                className="mt-5 w-full rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-blue-500"
-              >
-                Done
-              </button>
+                  Close
+                </button>
+              </div>
             </div>
           )}
 
