@@ -92,6 +92,14 @@ export function middleware(req: NextRequest): NextResponse {
     return NextResponse.next();
   }
 
+  // Webhook receivers are server-to-server callbacks (Circle, etc.) — no
+  // browser, no Origin/Referer, no session. They authenticate themselves
+  // via signature verification inside the route handler. CSRF gating is
+  // not the right protection model here, so let them through.
+  if (pathname.startsWith("/api/webhooks/")) {
+    return NextResponse.next();
+  }
+
   const isApi = pathname.startsWith("/api/");
 
   // ── 1. CSRF gate on mutating API requests ─────────────────────────
