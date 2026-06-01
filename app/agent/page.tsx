@@ -3,6 +3,8 @@
 import { useState, useEffect, useRef, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import { useCircleWallet } from "../circle-wallet-context";
+import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 import {
   Send, Loader2, ArrowLeft, Check, X, AlertTriangle, RefreshCw,
   Plus, ChevronDown, Sparkles, ArrowUp, List, Zap,
@@ -171,6 +173,7 @@ function ConfirmCard({
 
 export default function AgentPage() {
   const router = useRouter();
+  const { session } = useCircleWallet();
   const [status, setStatus] = useState<AgentStatus | null>(null);
   const [statusLoading, setStatusLoading] = useState(true);
   const [messages, setMessages] = useState<Message[]>([
@@ -190,6 +193,40 @@ export default function AgentPage() {
   useEffect(() => {
     loadStatus();
   }, []);
+
+  // Realtime: webhooks update `agent_spend_log` and `agent_wallets` rows.
+  // Re-pull /api/agent/status on any change so balance + recent activity
+  // tick over without a manual reload.
+  useEffect(() => {
+    if (!session?.userId) return;
+    const supabase = createSupabaseBrowserClient();
+    const channel = supabase
+      .channel(`agent-live-${session.userId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "agent_spend_log",
+          filter: `user_id=eq.${session.userId}`,
+        },
+        () => { loadStatus(); }
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "agent_wallets",
+          filter: `user_id=eq.${session.userId}`,
+        },
+        () => { loadStatus(); }
+      )
+      .subscribe();
+
+    return () => { supabase.removeChannel(channel); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.userId]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });

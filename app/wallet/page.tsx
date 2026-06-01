@@ -10,6 +10,7 @@ import { QrModal } from "./qr-modal";
 import { RequestModal } from "./request-modal";
 import { WalletShell, type ActivityRow, type Tab, type TokenBalance } from "./wallet-shell";
 import WalletLoading from "./loading";
+import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 
 const ARC_EXPLORER = process.env.NEXT_PUBLIC_ARC_EXPLORER_URL || "https://testnet.arcscan.app/tx/";
 const ARC_RPC_URL = process.env.NEXT_PUBLIC_ARC_RPC_URL || "https://rpc.testnet.arc.network";
@@ -47,57 +48,98 @@ export default function WalletPage() {
   const [activity, setActivity] = useState<ActivityRow[]>([]);
   const [activeTab, setActiveTab] = useState<Tab>("home");
 
-  // Load agent activation flag + recent activity once the user is in.
+  // Reusable loader — called on mount AND whenever a webhook-driven row
+  // change comes in via Supabase Realtime.
+  const loadAgentStatus = useCallback(async () => {
+    try {
+      const r = await fetch("/api/agent/status");
+      const d = await r.json();
+      setAgentActivated(d.activated ?? false);
+      const rows: ActivityRow[] = Array.isArray(d.recentActivity)
+        ? d.recentActivity.map((row: {
+            id: string;
+            skill: string;
+            recipient_address?: string | null;
+            recipient_arc_name?: string | null;
+            amount_usdc: number | string;
+            tx_hash?: string | null;
+            status: string;
+            executed_at: string;
+          }) => ({
+            id: row.id,
+            kind:
+              row.skill === "WITHDRAW"
+                ? "WITHDRAW"
+                : row.skill === "SEND_USDC" || row.skill === "AGENT_SEND"
+                  ? "SEND"
+                  : row.skill === "RECEIVE"
+                    ? "RECEIVE"
+                    : "OTHER",
+            counterparty: row.recipient_address ?? null,
+            counterpartyArcName: row.recipient_arc_name ?? null,
+            amountUsdc: Number(row.amount_usdc) || 0,
+            status:
+              row.status === "COMPLETE" || row.status === "PENDING" || row.status === "FAILED"
+                ? (row.status as ActivityRow["status"])
+                : "COMPLETE",
+            txHash: row.tx_hash ?? null,
+            at: row.executed_at,
+          }))
+        : [];
+      setActivity(rows);
+    } catch {
+      setAgentActivated((prev) => prev ?? false);
+    }
+  }, []);
+
+  // Initial load once the user is authenticated.
   useEffect(() => {
     if (status !== "authenticated") return;
-    let cancelled = false;
-    fetch("/api/agent/status")
-      .then((r) => r.json())
-      .then((d) => {
-        if (cancelled) return;
-        setAgentActivated(d.activated ?? false);
-        // Map recentActivity (agent_spend_log rows) into the shell's shape.
-        const rows: ActivityRow[] = Array.isArray(d.recentActivity)
-          ? d.recentActivity.map((r: {
-              id: string;
-              skill: string;
-              recipient_address?: string | null;
-              recipient_arc_name?: string | null;
-              amount_usdc: number | string;
-              tx_hash?: string | null;
-              status: string;
-              executed_at: string;
-            }) => {
-              const counterpartyArcName = r.recipient_arc_name ?? null;
-              return {
-              id: r.id,
-              kind:
-                r.skill === "WITHDRAW"
-                  ? "WITHDRAW"
-                  : r.skill === "SEND_USDC"
-                    ? "SEND"
-                    : r.skill === "RECEIVE"
-                      ? "RECEIVE"
-                      : "OTHER",
-              counterparty: r.recipient_address ?? null,
-              counterpartyArcName,
-              amountUsdc: Number(r.amount_usdc) || 0,
-              status:
-                r.status === "COMPLETE" || r.status === "PENDING" || r.status === "FAILED"
-                  ? (r.status as ActivityRow["status"])
-                  : "COMPLETE",
-              txHash: r.tx_hash ?? null,
-              at: r.executed_at,
-            };
-            })
-          : [];
-        setActivity(rows);
-      })
-      .catch(() => {
-        if (!cancelled) setAgentActivated(false);
-      });
-    return () => { cancelled = true; };
-  }, [status]);
+    loadAgentStatus();
+  }, [status, loadAgentStatus]);
+
+  // Realtime: when the Circle webhook writes/updates a spend-log row OR the
+  // balance cache on `profiles`, refresh the activity feed and trigger a
+  // balance refetch so the UI moves without the user reloading.
+  useEffect(() => {
+    if (status !== "authenticated" || !session?.userId) return;
+    const supabase = createSupabaseBrowserClient();
+
+    const channel = supabase
+      .channel(`wallet-live-${session.userId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "agent_spend_log",
+          filter: `user_id=eq.${session.userId}`,
+        },
+        () => { loadAgentStatus(); }
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "profiles",
+          filter: `id=eq.${session.userId}`,
+        },
+        (payload) => {
+          // The webhook writes balance_cache_usdc directly; mirror it into
+          // the displayed balance immediately so we don't wait the 15s
+          // polling cycle.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const next = (payload.new as any)?.balance_cache_usdc;
+          if (typeof next === "string") setBalance(next);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [status, session?.userId, loadAgentStatus]);
 
   useEffect(() => {
     if (!session?.walletAddress) return;
