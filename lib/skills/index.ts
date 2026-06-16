@@ -10,7 +10,6 @@ import "server-only";
 import type { SkillHandler } from "./types";
 import { CheckBalance }      from "./check-balance";
 import { SendUsdc }          from "./send-usdc";
-import { RecurringPayment }  from "./recurring-payment";
 import { CreatePolicy }      from "./create-policy";
 import { ListPolicies }      from "./list-policies";
 import { SetLimit }          from "./set-limit";
@@ -20,11 +19,12 @@ import { SwapUsdc }          from "./swap-usdc";
 import { BridgeUsdc }        from "./bridge-usdc";
 import { PayX402 }           from "./pay-x402";
 import { SendToken }         from "./send-token";
+import { GetPrice }          from "./get-price";
+import { IKnow }             from "./iknow";
 
 export const skillRegistry: Record<string, SkillHandler> = {
   CHECK_BALANCE:      CheckBalance,
   SEND_USDC:          SendUsdc,
-  RECURRING_PAYMENT:  RecurringPayment, // DEPRECATED: use CREATE_POLICY
   CREATE_POLICY:      CreatePolicy,
   LIST_POLICIES:      ListPolicies,
   SET_LIMIT:          SetLimit,
@@ -34,6 +34,8 @@ export const skillRegistry: Record<string, SkillHandler> = {
   BRIDGE_USDC:        BridgeUsdc,
   PAY_X402:           PayX402,
   SEND_TOKEN:         SendToken,
+  GET_PRICE:          GetPrice,
+  IKNOW:              IKnow,
 };
 
 export type {
@@ -41,7 +43,5 @@ export type {
   SkillContext,
   SkillOutput,
   AgentPolicy,
-  CronContext,
-  CronTickOutput,
   SkillCategory,
 } from "./types";

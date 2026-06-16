@@ -25,6 +25,11 @@ type PrepareResponse = {
   resolvedAddress: string;
   resolvedName: string | null;
   amount: string;
+  // Issue #17: id of the PENDING wallet_transactions row inserted by
+  // send-prepare. Used to poll for the tx_hash that Circle's webhook
+  // writes back ~2-3s after the SDK reports COMPLETE. May be null if the
+  // best-effort activity log insert failed server-side.
+  pendingRowId?: string | null;
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -62,8 +67,14 @@ export function SendModal({ onClose, onSent }: SendModalProps) {
   // ── What the SERVER resolved (used in confirm + signing)
   const [prepared, setPrepared] = useState<PrepareResponse | null>(null);
 
-  // ── Tx hash captured from Circle SDK on success (null until done)
+  // ── Tx hash captured from Circle SDK on success (null until done).
+  //    On Arc Testnet the SDK frequently returns null — see the polling
+  //    effect below which fills this in from the webhook-populated row.
   const [txHash, setTxHash] = useState<string | null>(null);
+  // True while we're polling /api/wallet/tx-hash for the webhook to
+  // surface the hash. Drives the "Confirming…" placeholder copy on the
+  // Done screen so the user knows we're still working.
+  const [hashPolling, setHashPolling] = useState(false);
 
   // ── Signing-step status escalation. After ~4s of waiting we swap the
   //    label to a friendlier "still loading" message so the user knows
@@ -171,6 +182,67 @@ export function SendModal({ onClose, onSent }: SendModalProps) {
     const t = setTimeout(() => setSigningStalled(true), 4000);
     return () => clearTimeout(t);
   }, [step]);
+
+  // ── Issue #17: poll for the tx hash from the webhook ___________________
+  //
+  // Circle's W3S browser SDK does not consistently return `txHash` in
+  // `onComplete` on Arc Testnet — the value arrives 2-3 seconds later via
+  // the webhook, which writes it to the wallet_transactions row. Without
+  // this poll the "View transaction" button on the Done screen never
+  // renders even though we know the hash exists.
+  //
+  // We only poll when we entered Done WITHOUT a hash AND have a row id
+  // to look up. Capped at ~12s (15 attempts × 800ms) so a webhook outage
+  // can't keep the modal busy forever — worst case the user falls back
+  // to the Activity tab to find the hash.
+  useEffect(() => {
+    if (step !== "done") return;
+    if (txHash) return;
+    if (!prepared?.pendingRowId) return;
+
+    const id = prepared.pendingRowId;
+    let cancelled = false;
+    let attempts = 0;
+    const MAX_ATTEMPTS = 15;
+    const INTERVAL_MS = 800;
+
+    setHashPolling(true);
+
+    const poll = async () => {
+      if (cancelled) return;
+      attempts += 1;
+      try {
+        const res = await fetch(
+          `/api/wallet/tx-hash?id=${encodeURIComponent(id)}`,
+          { credentials: "include" },
+        );
+        if (res.ok) {
+          const data = (await res.json()) as { txHash: string | null };
+          if (!cancelled && data.txHash) {
+            setTxHash(data.txHash);
+            setHashPolling(false);
+            return;
+          }
+        }
+      } catch {
+        // Swallow — transient network errors should not abort the poll.
+      }
+      if (cancelled) return;
+      if (attempts >= MAX_ATTEMPTS) {
+        setHashPolling(false);
+        return;
+      }
+      timer = setTimeout(poll, INTERVAL_MS);
+    };
+
+    let timer: ReturnType<typeof setTimeout> = setTimeout(poll, INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      setHashPolling(false);
+    };
+  }, [step, txHash, prepared?.pendingRowId]);
 
   const handleClose = useCallback(() => {
     // Don't allow dismissal while PIN dialog or prepare is in flight
@@ -444,9 +516,12 @@ export function SendModal({ onClose, onSent }: SendModalProps) {
                 Settled on Arc Testnet. Your balance will refresh in a moment.
               </p>
               <div className="mt-5 flex gap-2">
-                {/* Tx hash button — only renders when Circle returned a hash.
-                    Without it the explorer URL lands on the homepage. */}
-                {txHash && (
+                {/* Tx hash button. Renders the explorer link as soon as we
+                    have the hash — either from the SDK (rare on Arc Testnet)
+                    or from polling the webhook-populated row (see effect
+                    above). While polling we show a disabled placeholder so
+                    the slot doesn't snap-in when the hash arrives. */}
+                {txHash ? (
                   <a
                     href={`${ARC_EXPLORER}${txHash}`}
                     target="_blank"
@@ -458,7 +533,17 @@ export function SendModal({ onClose, onSent }: SendModalProps) {
                       <path strokeLinecap="round" strokeLinejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
                     </svg>
                   </a>
-                )}
+                ) : hashPolling ? (
+                  <button
+                    type="button"
+                    disabled
+                    className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl border border-white/15 px-4 py-2.5 text-sm font-medium text-white/50"
+                    title="Waiting for confirmation on chain…"
+                  >
+                    <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-white/40 border-t-transparent" aria-hidden />
+                    <span>Confirming…</span>
+                  </button>
+                ) : null}
                 <button
                   onClick={onClose}
                   className="flex-1 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-blue-500"

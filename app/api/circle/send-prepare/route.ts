@@ -187,27 +187,40 @@ export async function POST(req: Request) {
     // manual sends from the main wallet. Best-effort: never block the send
     // if this fails, but log loudly so RLS / column-mismatch issues are
     // visible in Vercel logs.
+    //
+    // Issue #17: We capture the inserted row's id and return it to the
+    // client. After the send completes the SDK frequently returns no
+    // tx_hash on Arc Testnet — the webhook populates it ~2-3s later. The
+    // client polls /api/wallet/tx-hash?id=<pendingRowId> until it appears
+    // so the "View transaction" button can render.
+    let pendingRowId: string | null = null;
     try {
       const supabase = await createSupabaseServerClient();
       const { data: { user }, error: authErr } = await supabase.auth.getUser();
       if (authErr || !user?.id) {
         console.error("[send-prepare] activity log skipped: no user", { authErr, hasUser: !!user });
       } else {
-        const { error: insertErr } = await supabase.from("wallet_transactions").insert({
-          user_id: user.id,
-          direction: "SEND",
-          counterparty_address: resolvedAddress,
-          counterparty_arc_name: resolvedName,
-          amount: amount,
-          token_symbol: "USDC",
-          status: "PENDING",
-          // Don't write circle_tx_id here. Circle's webhook arrives with
-          // notification.id (a different value than the challengeId we
-          // have right now). The webhook's claim-PENDING matcher looks
-          // for circle_tx_id IS NULL to claim recently inserted rows.
-        });
+        const { data: inserted, error: insertErr } = await supabase
+          .from("wallet_transactions")
+          .insert({
+            user_id: user.id,
+            direction: "SEND",
+            counterparty_address: resolvedAddress,
+            counterparty_arc_name: resolvedName,
+            amount: amount,
+            token_symbol: "USDC",
+            status: "PENDING",
+            // Don't write circle_tx_id here. Circle's webhook arrives with
+            // notification.id (a different value than the challengeId we
+            // have right now). The webhook's claim-PENDING matcher looks
+            // for circle_tx_id IS NULL to claim recently inserted rows.
+          })
+          .select("id")
+          .single();
         if (insertErr) {
           console.error("[send-prepare] activity log insert failed:", insertErr);
+        } else if (inserted?.id) {
+          pendingRowId = inserted.id as string;
         }
       }
     } catch (logErr) {
@@ -224,6 +237,11 @@ export async function POST(req: Request) {
       resolvedAddress,
       resolvedName,
       amount,
+      // Issue #17: id of the PENDING wallet_transactions row, so the client
+      // can poll for tx_hash after Circle webhooks populate it. May be null
+      // if the activity-log insert failed (in which case the View tx button
+      // simply won't render).
+      pendingRowId,
     });
   } catch (error: unknown) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

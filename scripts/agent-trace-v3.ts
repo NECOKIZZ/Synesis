@@ -12,11 +12,48 @@
  *   npx tsx scripts/agent-trace-v3.ts --file test-cases/v3/multi-intent.json
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
+
 import {
   buildSystemPromptV3,
   validateInterpretResult,
 } from "../lib/agent-core-v3";
 import type { InterpretResult } from "../lib/agent-types";
+
+// ── Lightweight .env loader ─────────────────────────────────────────────
+// Node + tsx don't auto-load .env files. Rather than adding a dotenv
+// dependency just for this trace script, we read .env.local directly.
+// Only sets variables that aren't already in process.env, so a real
+// shell-level export still wins. Quotes are stripped, lines starting
+// with `#` are skipped, and we silently ignore a missing file.
+function loadEnvLocal(): void {
+  const envPath = path.join(process.cwd(), ".env.local");
+  let raw: string;
+  try {
+    raw = fs.readFileSync(envPath, "utf-8");
+  } catch {
+    return;
+  }
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq < 0) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let value = trimmed.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (key && process.env[key] === undefined) {
+      process.env[key] = value;
+    }
+  }
+}
+loadEnvLocal();
 
 const args = process.argv.slice(2);
 

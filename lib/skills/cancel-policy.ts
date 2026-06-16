@@ -20,6 +20,9 @@ export const CancelPolicy: SkillHandler = {
   category: "POLICY",
   version: 2,
   affectsFunds: false,
+  // No PIN: cancelling a policy stops future spending — strictly
+  // safer, no outward movement.
+  requiresPin: false,
 
   async execute({ supabase, supabaseUserId, params }: SkillContext): Promise<SkillOutput> {
     // ── Mode 1: specific policy IDs from LLM matching ──────────────

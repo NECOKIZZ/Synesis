@@ -22,7 +22,7 @@ import "server-only";
 import { isAddress, formatUnits } from "ethers";
 import { AppKit } from "@circle-fin/app-kit";
 import { getCircleAdapter } from "@/lib/circleAdapter";
-import { readUsdcBalanceWei, circleDev } from "@/lib/circle";
+import { readUsdcBalanceWei, circleDev, circleRead } from "@/lib/circle";
 import { resolveRecipient, normalizeName } from "@/lib/ans";
 import {
   checkSpendLimits,
@@ -123,7 +123,9 @@ export const SendToken: SkillHandler = {
       } else {
         // Circle API returns all token balances including alias-only tokens
         if (!circleDev) throw new Error("Circle client not configured");
-        const res = await circleDev.getWalletTokenBalance({ id: agentWallet.circle_wallet_id });
+        const res = await circleRead("getWalletTokenBalance(send-token)", () =>
+          circleDev!.getWalletTokenBalance({ id: agentWallet.circle_wallet_id }),
+        );
         const balances = res.data?.tokenBalances ?? [];
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const entry = balances.find((b: any) =>

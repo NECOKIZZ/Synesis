@@ -19,7 +19,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import QRCode from "qrcode";
 import { useCircleWallet } from "@/app/circle-wallet-context";
-import type { AnyTaskResult } from "@/lib/agent-types";
+import { friendlyError, friendlyApiError } from "@/lib/friendly-errors";
+import { buildConversationHistory } from "@/lib/agent-history";
+import { useSessionEndSummary } from "@/lib/memory/use-session-end-summary";
+import { MicButton } from "@/components/voice/MicButton";
+import { SpeakButton } from "@/components/voice/SpeakButton";
+import type { InterpretResult, Task, Trigger, PlanStep } from "@/lib/agent-types";
 import {
   Home as HomeIcon,
   Activity as ActivityIcon,
@@ -895,8 +900,21 @@ type AgentMessage = {
   id: string;
   role: "user" | "agent" | "system";
   text: string;
-  skillResult?: AnyTaskResult;
+  /** V3: the interpreter result owning this message's pending confirmation. */
+  interpret?: InterpretResult;
   pending?: boolean;
+};
+
+/** Per-task response from POST /api/agent/confirm-policy. */
+type TaskResultResponse =
+  | { ok: true; kind: "executed" | "policy"; task_index: number; result: Record<string, unknown>; steps?: Array<{ step: number; description: string; ok: boolean; result?: Record<string, unknown>; error?: string }> }
+  | { ok: false; kind: "executed" | "policy"; task_index: number; error: string; steps?: Array<{ step: number; description: string; ok: boolean; result?: Record<string, unknown>; error?: string }> };
+
+type ConfirmBatchResponse = {
+  results: TaskResultResponse[];
+  ok: boolean;
+  successCount: number;
+  totalCount: number;
 };
 
 type AgentStatus = {
@@ -944,7 +962,7 @@ function AgentTab({ arcName }: { arcName: string | null }) {
   }]);
   const [input, setInput] = useState("");
   const [interpreting, setInterpreting] = useState(false);
-  const [pendingSkill, setPendingSkill] = useState<{ msgId: string; result: AnyTaskResult } | null>(null);
+  const [pendingConfirm, setPendingConfirm] = useState<{ msgId: string; interpret: InterpretResult } | null>(null);
   const [cancelModal, setCancelModal] = useState<{ policyId: string; summary: string } | null>(null);
   const [cancelPin, setCancelPin] = useState("");
   const [cancelLoading, setCancelLoading] = useState(false);
@@ -973,6 +991,10 @@ function AgentTab({ arcName }: { arcName: string | null }) {
   useEffect(() => { loadStatus(true); }, [loadStatus]);
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
 
+  // Layer C — fire a session-end summary on tab close / 10-min idle.
+  // Server route gates on MEMWAL_ENABLED so this is safe to leave on.
+  useSessionEndSummary(messages);
+
   // ── Onboarding handlers ──────────────────────────────────────────
   const obErr = (msg: string) => { setObError(msg); setObLoading(false); };
 
@@ -984,8 +1006,9 @@ function AgentTab({ arcName }: { arcName: string | null }) {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    const data = await res.json();
-    if (!res.ok) return obErr(data.error ?? "Activation failed");
+    if (!res.ok) {
+      return obErr(await friendlyApiError(res, "Couldn't activate the agent. Please try again."));
+    }
     setObLoading(false); setOnboardStep("pin");
   }
 
@@ -998,8 +1021,9 @@ function AgentTab({ arcName }: { arcName: string | null }) {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ pin }),
     });
-    const data = await res.json();
-    if (!res.ok) return obErr(data.error ?? "Failed to set PIN");
+    if (!res.ok) {
+      return obErr(await friendlyApiError(res, "We couldn't save your PIN. Please try again."));
+    }
     setObLoading(false); setOnboardStep("limits");
   }
 
@@ -1012,8 +1036,9 @@ function AgentTab({ arcName }: { arcName: string | null }) {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ pin, maxPerTransaction: perTx, maxDaily: daily, maxMonthly: monthly }),
     });
-    const data = await res.json();
-    if (!res.ok) return obErr(data.error ?? "Failed to save limits");
+    if (!res.ok) {
+      return obErr(await friendlyApiError(res, "We couldn't save those limits. Please try again."));
+    }
     setObLoading(false); setOnboardStep("fund");
   }
 
@@ -1026,8 +1051,10 @@ function AgentTab({ arcName }: { arcName: string | null }) {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ amount: amount.toFixed(6) }),
     });
+    if (!res.ok) {
+      return obErr(await friendlyApiError(res, "We couldn't prepare the funding transfer. Please try again."));
+    }
     const data = await res.json();
-    if (!res.ok) return obErr(data.error ?? "Failed to prepare funding");
     try {
       await executeChallenge(data.challengeId, data.userToken, data.encryptionKey);
     } catch (e) {
@@ -1049,7 +1076,7 @@ function AgentTab({ arcName }: { arcName: string | null }) {
         }
         return obErr("Network error during confirmation. If your agent balance shows funds, you're all set — otherwise retry.");
       }
-      return obErr(msg || "Circle challenge failed");
+      return obErr(friendlyError(e, "PIN confirmation was cancelled. Please try again."));
     }
     setObLoading(false); setOnboardStep("done");
     await loadStatus();
@@ -1064,38 +1091,176 @@ function AgentTab({ arcName }: { arcName: string | null }) {
     setMessages((prev) => prev.map((m) => m.id === id ? { ...m, ...update } : m));
   }
 
-  function extractSkillAmount(sr: AnyTaskResult): number {
-    if (sr.task_type === "immediate") {
-      if (sr.skill === "SEND_USDC" || sr.skill === "WITHDRAW") {
-        const a = Number(sr.params.amount ?? 0);
-        if (sr.params.amount === "all") return 0;
-        return isFinite(a) ? a : 0;
+  /**
+   * Sum of USDC required across every "now" task in the batch.
+   * Mirrors the server-side `totalUpfrontUsdc` in confirm-policy/route.ts
+   * so the client-side pre-flight matches what the server will enforce.
+   * Policy tasks (recurring / conditional) don't draw funds at confirm
+   * time — only their first scheduled execution does — so we exclude them.
+   */
+  function extractBatchUsdcAmount(ir: InterpretResult): number {
+    return ir.tasks.reduce((acc, t) => {
+      if (t.trigger.type !== "now") return acc;
+      return acc + sumStepsUsdc(t.steps);
+    }, 0);
+  }
+
+  function sumStepsUsdc(steps: PlanStep[]): number {
+    return steps.reduce((sum, step) => {
+      const raw = step.params.amount;
+      if (typeof raw === "string" && raw.startsWith("$prev")) return sum;
+      if (step.skill === "SEND_TOKEN") return sum;
+      if (step.skill === "SWAP_USDC") {
+        const tokenIn = String(step.params.tokenIn ?? "USDC").toUpperCase();
+        if (tokenIn !== "USDC") return sum;
       }
-      if (sr.skill === "SWAP_USDC" || sr.skill === "BRIDGE_USDC") {
-        const a = Number(sr.params.amount ?? 0);
-        return isFinite(a) ? a : 0;
-      }
-      if (sr.skill === "SEND_TOKEN") {
-        if (sr.params.amount === "all") return 0;
-        const a = Number(sr.params.amount ?? 0);
-        return isFinite(a) ? a : 0;
-      }
-      if (sr.skill === "CREATE_POLICY") {
-        const action = sr.params.action as Record<string, unknown> | undefined;
-        const ap = action?.params as Record<string, unknown> | undefined;
-        if (ap?.amount === "all") return 0;
-        const a = Number(ap?.amount ?? 0);
-        return isFinite(a) ? a : 0;
+      if (raw === "all") return sum;
+      const a = Number(raw ?? 0);
+      return sum + (isFinite(a) && a > 0 ? a : 0);
+    }, 0);
+  }
+
+  /**
+   * Render a single TaskResultResponse from the V3 batch endpoint into a
+   * friendly chat line. Mirrors the formatter in app/agent/page.tsx so
+   * both surfaces produce consistent post-execution text.
+   */
+  function formatTaskResult(task: Task, r: TaskResultResponse): string {
+    if (!r.ok) return `✗ ${r.error}`;
+    if (r.kind === "policy") {
+      const nextRun = r.result.nextRun as string | undefined;
+      const compound = r.result.compound === true;
+      const tail = nextRun ? ` Next run: ${new Date(nextRun).toLocaleDateString()}.` : "";
+      return `✓ ${compound ? "Compound " : ""}policy created.${tail}`;
+    }
+    // Run-now task — single step uses skill-specific formatting, multi-step
+    // shows per-step outcomes.
+    if (task.steps.length === 1) {
+      const single = task.steps[0];
+      const res = r.result;
+      switch (single.skill) {
+        case "SEND_USDC": {
+          const addr = String(res.recipientAddress ?? "");
+          const short = addr ? `${addr.slice(0, 8)}…${addr.slice(-4)}` : "recipient";
+          let line = `✓ Sent ${res.amountUsdc} USDC to ${short}`;
+          if (res.txHash) line += `\nTx: ${String(res.txHash).slice(0, 10)}…`;
+          return line;
+        }
+        case "WITHDRAW":
+          return `✓ Withdrew ${res.amountUsdc} USDC to your main wallet`;
+        case "SET_LIMIT":
+          return `✓ Updated ${res.updated} limit to $${res.amount} USDC`;
+        case "CANCEL_POLICY":
+          return `✓ Cancelled ${res.cancelledCount} polic${res.cancelledCount !== 1 ? "ies" : "y"}`;
+        case "CHECK_BALANCE": {
+          const tokens = Array.isArray(res?.tokens)
+            ? (res.tokens as Array<{ symbol: string; amount: string; approxUsdValue: number }>)
+            : [];
+          if (tokens.length > 1) {
+            const lines = tokens.map(
+              (t) =>
+                `  ${t.symbol}: ${parseFloat(t.amount).toFixed(t.symbol === "CIRBTC" || t.symbol === "cirBTC" ? 8 : 4)} (~$${t.approxUsdValue.toFixed(2)})`,
+            );
+            const total = (res.totalApproxUsdValue as number | undefined) ?? 0;
+            return `Agent wallet:\n${lines.join("\n")}\n  ─────────────\n  Total: ~$${total.toFixed(2)}`;
+          }
+          return `Agent balance: ${res.balanceUsdc} USDC`;
+        }
+        case "SEND_TOKEN": {
+          let line = `✓ Sent ${res.amount} ${res.token} to ${String(res.recipientAddress ?? "").slice(0, 8)}…`;
+          if (res.txHash) line += `\nTx: ${String(res.txHash).slice(0, 10)}…`;
+          return line;
+        }
+        case "SWAP_USDC": {
+          let line = `✓ Swapped ${res.amountIn} ${res.tokenIn} → ${res.amountOut} ${res.tokenOut}`;
+          if (res.txHash) line += `\nTx: ${String(res.txHash).slice(0, 10)}…`;
+          return line;
+        }
+        case "BRIDGE_USDC": {
+          let line = `✓ Bridged ${res.amount} USDC from ${res.fromChain} → ${res.toChain}`;
+          if (res.burnTxHash) line += `\nTx: ${String(res.burnTxHash).slice(0, 10)}…`;
+          return line;
+        }
+        case "PAY_X402":
+          return res.paid
+            ? `✓ Paid ${res.amountUsdc} USDC · data received` +
+                (res.txHash ? `\nTx: ${String(res.txHash).slice(0, 10)}…` : "")
+            : `Response: ${JSON.stringify(res.data).slice(0, 120)}`;
+        case "GET_PRICE": {
+          const price = Number(res.priceUsd ?? 0);
+          const age = Number(res.ageSeconds ?? 0);
+          return `Current price of ${res.symbol}: $${price.toFixed(2)} (source: ${res.source}, ${age}s old)`;
+        }
+        case "IKNOW": {
+          const verdict = String(res?.verdict ?? "");
+          const stage = String(res?.stage ?? "");
+          const belief = String(res?.belief ?? "");
+          const market = res?.market as Record<string, unknown> | undefined;
+
+          // Show the market whenever the oracle found a match, even if
+          // success === false (e.g. critic unavailable).  The market
+          // data is still valid.
+          if (verdict === "MATCH" && market) {
+            const title = String(market.title ?? "");
+            const yesOdds = Number(market.yesOdds ?? 0);
+            const noOdds = Number(market.noOdds ?? 0);
+            const side = String(market.side ?? "");
+            const url = String(market.url ?? "");
+            const verdictReason = String(res?.verdictReason ?? "");
+            let msg = `You can make money off that opinion — check out this market:\n\n"${title}"`;
+            msg += `\nYes: ${yesOdds.toFixed(2)}  |  No: ${noOdds.toFixed(2)}`;
+            if (side) msg += `\nYour side: ${side.toUpperCase()}`;
+            if (verdictReason) msg += `\nWhy: ${verdictReason}`;
+            if (url) msg += `\n\n${url}`;
+            return msg;
+          }
+
+          if (stage === "broad_summary") {
+            const suggestions = Array.isArray(res?.suggestions)
+              ? (res.suggestions as Array<Record<string, unknown>>)
+              : [];
+            const lines = suggestions.map((s, i) =>
+              `${i + 1}. ${s.title} — Yes: ${Number(s.yesOdds ?? 0).toFixed(2)}, No: ${Number(s.noOdds ?? 0).toFixed(2)}`
+            );
+            return `That's a broad belief! Here are some related markets:\n${lines.join("\n")}\n\nReply with a number to pick one.`;
+          }
+
+          const success = res?.success === true;
+          if (!success) {
+            const suggestions = Array.isArray(res?.suggestions)
+              ? (res.suggestions as Array<Record<string, unknown>>)
+              : [];
+            if (suggestions.length > 0) {
+              const lines = suggestions.map((s, i) =>
+                `${i + 1}. ${s.title} — Yes: ${Number(s.yesOdds ?? 0).toFixed(2)}, No: ${Number(s.noOdds ?? 0).toFixed(2)}`
+              );
+              return `Hmm, I couldn't find an exact match for "${belief}". Here are the closest markets:\n${lines.join("\n")}\n\nReply with a number to pick one.`;
+            }
+            return `I couldn't find a prediction market for "${belief}". Try rephrasing with a clearer event.`;
+          }
+          return `Found a match for "${belief}" but market details were incomplete.`;
+        }
+        case "LIST_POLICIES": {
+          const active = Array.isArray(res?.active) ? (res.active as Array<Record<string, unknown>>) : [];
+          if (active.length === 0) return "You have no active policies.";
+          return (
+            `You have ${active.length} active polic${active.length !== 1 ? "ies" : "y"}:\n` +
+            active
+              .map(
+                (p, i) =>
+                  `${i + 1}. ${p.summary}${p.nextRun ? " — next run " + new Date(p.nextRun as string).toLocaleDateString() : ""}`,
+              )
+              .join("\n")
+          );
+        }
+        default:
+          return "✓ Done.";
       }
     }
-    if (sr.task_type === "compound") {
-      return sr.steps.reduce((sum, step) => {
-        if (step.skill === "SEND_TOKEN") return sum;
-        const a = Number(step.params.amount ?? 0);
-        return sum + (isFinite(a) ? a : 0);
-      }, 0);
-    }
-    return 0;
+    // Compound — one line per step.
+    const steps = r.steps ?? [];
+    const lines = steps.map((s) => (s.ok ? `  ✓ ${s.description}` : `  ✗ ${s.description}: ${s.error}`));
+    return `✓ Compound task complete:\n${lines.join("\n")}`;
   }
 
   async function handleSend() {
@@ -1103,133 +1268,99 @@ function AgentTab({ arcName }: { arcName: string | null }) {
     if (!instruction || interpreting) return;
     setInput("");
     if (inputRef.current) inputRef.current.style.height = "auto";
+    // Layer A — capture prior turns BEFORE appending the new user message
+    // (setState is async, so `messages` here still excludes this turn).
+    const history = buildConversationHistory(messages);
     addMessage({ role: "user", text: instruction });
     setInterpreting(true);
     const thinkingId = addMessage({ role: "agent", text: "Thinking…", pending: true });
     const res = await fetch("/api/agent/interpret", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ instruction }),
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ instruction, history }),
     });
     setInterpreting(false);
     if (!res.ok) {
-      const d = await res.json().catch(() => ({}));
-      updateMessage(thinkingId, { text: d.error ?? "Failed to interpret instruction", pending: false });
+      const friendly = await friendlyApiError(res, "I couldn't reach the assistant. Please try again.");
+      updateMessage(thinkingId, { text: friendly, pending: false });
       return;
     }
-    const skillResult: AnyTaskResult = await res.json();
-    if (skillResult.task_type === "immediate" && skillResult.skill === "UNKNOWN") {
-      updateMessage(thinkingId, { text: String(skillResult.params.explanation ?? "I didn't understand that. Could you rephrase?"), pending: false });
-      return;
-    }
-    if (skillResult.task_type === "immediate" && (skillResult.skill === "CHECK_BALANCE" || skillResult.skill === "LIST_POLICIES")) {
-      updateMessage(thinkingId, { text: skillResult.skill === "LIST_POLICIES" ? "Fetching policies…" : "Checking balance…", pending: true });
-      await confirmSkill(thinkingId, skillResult, "");
-      return;
-    }
+    const interpret: InterpretResult = await res.json();
 
-    // ── Pre-flight balance guard (client-side, before confirm card) ──
-    // Use the already-loaded agentStatus balance so the user never
-    // reaches the PIN prompt only to be told they can't afford it.
-    const knownBalance = parseFloat(agentStatus?.wallet?.balanceUsdc ?? "0");
-    const requiredAmount = extractSkillAmount(skillResult);
-    if (requiredAmount > 0 && knownBalance < requiredAmount) {
+    if (interpret.tasks.length === 0) {
       updateMessage(thinkingId, {
-        text: `Insufficient balance. Your agent wallet has ${knownBalance.toFixed(2)} USDC but this action needs ${requiredAmount.toFixed(2)} USDC. Top up from the Fund section.`,
+        text: interpret.unknown_reason ?? "I didn't understand that. Could you rephrase?",
         pending: false,
       });
       return;
     }
 
-    updateMessage(thinkingId, { text: skillResult.confirmation_message, skillResult, pending: false });
-    setPendingSkill({ msgId: thinkingId, result: skillResult });
+    // Read-only single CHECK_BALANCE / LIST_POLICIES / IKNOW / GET_PRICE batches auto-confirm.
+    const onlyTask = interpret.tasks.length === 1 ? interpret.tasks[0] : null;
+    const onlyStep = onlyTask && onlyTask.steps.length === 1 ? onlyTask.steps[0] : null;
+    const readOnlySkills = new Set(["CHECK_BALANCE", "LIST_POLICIES", "IKNOW", "GET_PRICE"]);
+    if (onlyStep && readOnlySkills.has(onlyStep.skill)) {
+      const loadingText =
+        onlyStep.skill === "LIST_POLICIES" ? "Fetching policies…" :
+        onlyStep.skill === "IKNOW" ? "Searching prediction markets…" :
+        onlyStep.skill === "GET_PRICE" ? "Fetching live price…" :
+        "Checking balance…";
+      updateMessage(thinkingId, { text: loadingText, pending: true });
+      setPendingConfirm({ msgId: thinkingId, interpret });
+      await runConfirm(thinkingId, interpret, "");
+      return;
+    }
+
+    // Pre-flight balance guard (client-side, before PIN entry).
+    const knownBalance = parseFloat(agentStatus?.wallet?.balanceUsdc ?? "0");
+    const requiredAmount = extractBatchUsdcAmount(interpret);
+    if (requiredAmount > 0 && knownBalance < requiredAmount) {
+      updateMessage(thinkingId, {
+        text: `Insufficient balance. Your agent wallet has ${knownBalance.toFixed(2)} USDC but this batch needs ${requiredAmount.toFixed(2)} USDC. Top up from the Fund section.`,
+        pending: false,
+      });
+      return;
+    }
+
+    updateMessage(thinkingId, { text: interpret.combined_confirmation_message, interpret, pending: false });
+    setPendingConfirm({ msgId: thinkingId, interpret });
   }
 
-  async function confirmSkill(msgId: string, skillResult: AnyTaskResult, pin: string) {
-    let body: Record<string, unknown>;
-    if (skillResult.task_type === "compound") {
-      body = { pin, task_type: "compound", steps: skillResult.steps };
-    } else if (skillResult.task_type === "recurring") {
-      body = {
-        pin, task_type: "recurring",
-        schedule: skillResult.schedule,
-        schedule_params: skillResult.schedule_params,
-        action: skillResult.action,
-        steps: skillResult.steps,
-        execution_mode: skillResult.execution_mode,
-        stop_conditions: skillResult.stop_conditions,
-        confirmation_message: skillResult.confirmation_message,
-      };
-    } else if (skillResult.task_type === "conditional") {
-      body = {
-        pin, task_type: "conditional",
-        trigger: skillResult.trigger,
-        action: skillResult.action,
-        steps: skillResult.steps,
-        execution_mode: skillResult.execution_mode,
-        stop_conditions: skillResult.stop_conditions,
-        confirmation_message: skillResult.confirmation_message,
-      };
-    } else {
-      body = { pin, task_type: "immediate", skill: skillResult.skill, params: skillResult.params };
-    }
+  /**
+   * Submit the full V3 task batch to /api/agent/confirm-policy with a
+   * single PIN. The endpoint returns per-task results; we render each
+   * as its own line so partial-success states are readable.
+   */
+  async function runConfirm(msgId: string, interpret: InterpretResult, pin: string) {
     const res = await fetch("/api/agent/confirm-policy", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pin, tasks: interpret.tasks }),
     });
-    const data = await res.json();
-    setPendingSkill(null);
-    if (!res.ok) { updateMessage(msgId, { skillResult: undefined, text: data.error ?? "Action failed", pending: false }); return; }
-    const r = data.result;
-    let resultText = "";
-
-    // compound task result
-    if (data.task_type === "compound") {
-      const planSteps = Array.isArray(data.steps)
-        ? data.steps as Array<{ step: number; description: string; ok: boolean; result?: unknown; error?: string }>
-        : [];
-      resultText = planSteps.map(s => `${s.ok ? "✓" : "✗"} Step ${s.step}: ${s.description}`).join("\n");
+    let data: ConfirmBatchResponse | { error?: string };
+    try {
+      data = await res.json();
+    } catch {
+      setPendingConfirm(null);
+      updateMessage(msgId, { interpret: undefined, text: "The server returned an unexpected response. Please try again.", pending: false });
+      return;
     }
-    // recurring / conditional policy result
-    else if (data.task_type === "recurring" || data.task_type === "conditional") {
-      resultText = `✓ Policy created. Next run: ${r?.nextRun ? new Date(r.nextRun).toLocaleDateString() : "N/A"}`;
+    setPendingConfirm(null);
+    if (!("results" in data)) {
+      updateMessage(msgId, {
+        interpret: undefined,
+        text: friendlyError(data.error, "That action couldn't be completed."),
+        pending: false,
+      });
+      return;
+    }
+    const summary = data.results
+      .map((r) => formatTaskResult(interpret.tasks[r.task_index], r))
+      .join("\n\n");
+    updateMessage(msgId, { interpret: undefined, text: summary, pending: false });
+    if (data.results.some((r) => r.ok)) {
       await loadStatus();
     }
-    // immediate single-skill results
-    else if (data.task_type === "immediate") {
-      switch (data.skill) {
-        case "SEND_USDC": resultText = `✓ Sent ${r.amountUsdc} USDC to ${r.recipientAddress?.slice(0,8)}…${r.recipientAddress?.slice(-4)}`; if (r.txHash) resultText += `\nTx: ${r.txHash.slice(0, 10)}…`; break;
-        case "WITHDRAW": resultText = `✓ Withdrew ${r.amountUsdc} USDC to your main wallet`; await loadStatus(); break;
-        case "SET_LIMIT": resultText = `✓ Updated ${r.updated} limit to $${r.amount} USDC`; await loadStatus(); break;
-        case "CANCEL_POLICY": resultText = `✓ Cancelled ${r.cancelledCount} polic${r.cancelledCount !== 1 ? "ies" : "y"}`; await loadStatus(); break;
-        case "CREATE_POLICY": resultText = `✓ Policy created. Next run: ${r.nextRun ? new Date(r.nextRun).toLocaleDateString() : "N/A"}`; await loadStatus(); break;
-        case "CHECK_BALANCE": {
-          const tokens = Array.isArray(r?.tokens) ? r.tokens as Array<{symbol:string;amount:string;approxUsdValue:number}> : [];
-          if (tokens.length > 1) {
-            const lines = tokens.map(t => `  ${t.symbol}: ${parseFloat(t.amount).toFixed(t.symbol==="CIRBTC"||t.symbol==="cirBTC"?8:4)} (~$${t.approxUsdValue.toFixed(2)})`);
-            const total = (r.totalApproxUsdValue as number | undefined) ?? 0;
-            resultText = `Agent wallet:\n${lines.join("\n")}\n  ─────────────\n  Total: ~$${total.toFixed(2)}`;
-          } else {
-            resultText = `Agent balance: ${r.balanceUsdc} USDC`;
-          }
-          break;
-        }
-        case "SEND_TOKEN": resultText = `✓ Sent ${r.amount} ${r.token} to ${String(r.recipientAddress).slice(0,8)}…`; if (r.txHash) resultText += `\nTx: ${String(r.txHash).slice(0,10)}…`; break;
-        case "SWAP_USDC": resultText = `✓ Swapped ${r.amountIn} ${r.tokenIn} → ${r.amountOut} ${r.tokenOut}`; if (r.txHash) resultText += `\nTx: ${String(r.txHash).slice(0,10)}…`; break;
-        case "BRIDGE_USDC": resultText = `✓ Bridged ${r.amount} USDC from ${r.fromChain} → ${r.toChain}`; if (r.burnTxHash) resultText += `\nTx: ${String(r.burnTxHash).slice(0,10)}…`; break;
-        case "PAY_X402": resultText = r.paid ? `✓ Paid ${r.amountUsdc} USDC · data received` + (r.txHash ? `\nTx: ${String(r.txHash).slice(0,10)}…` : "") : `Response: ${JSON.stringify(r.data).slice(0,120)}`; break;
-        case "LIST_POLICIES": {
-          const active = Array.isArray(r?.active) ? (r.active as Array<Record<string,unknown>>) : [];
-          if (active.length === 0) { resultText = "You have no active policies."; break; }
-          resultText = `You have ${active.length} active polic${active.length !== 1 ? "ies" : "y"}:\n` +
-            active.map((p, i) => `${i + 1}. ${p.summary}${p.nextRun ? " — next run " + new Date(p.nextRun as string).toLocaleDateString() : ""}`).join("\n");
-          break;
-        }
-        default: resultText = r ? JSON.stringify(r) : "Action completed.";
-      }
-    } else {
-      resultText = r ? JSON.stringify(r) : "Action completed.";
-    }
-    updateMessage(msgId, { skillResult: undefined, text: resultText, pending: false });
   }
 
   async function doCancel() {
@@ -1240,10 +1371,14 @@ function AgentTab({ arcName }: { arcName: string | null }) {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ pin: cancelPin, policyId: cancelModal.policyId }),
       });
-      const data = await res.json();
-      if (!res.ok) { setCancelError(data.error ?? "Cancel failed"); }
-      else { setCancelModal(null); setCancelPin(""); await loadStatus(); }
-    } catch (e) { setCancelError(e instanceof Error ? e.message : "Network error"); }
+      if (!res.ok) {
+        setCancelError(await friendlyApiError(res, "Couldn't cancel that automation. Please try again."));
+      } else {
+        setCancelModal(null); setCancelPin(""); await loadStatus();
+      }
+    } catch (e) {
+      setCancelError(friendlyError(e, "Network hiccup — check your connection and try again."));
+    }
     finally { setCancelLoading(false); }
   }
 
@@ -1349,27 +1484,43 @@ function AgentTab({ arcName }: { arcName: string | null }) {
                             {msg.text}
                           </div>
                         ) : null}
-                        {msg.skillResult && pendingSkill?.msgId === msg.id && (
+                        {!msg.pending && msg.text && (
+                          <div className="flex items-center gap-1">
+                            <SpeakButton
+                              text={msg.text}
+                              sizeClass="h-6 w-6"
+                              iconClass="h-3 w-3"
+                              className="text-white/40 hover:bg-white/10 hover:text-white/80"
+                            />
+                          </div>
+                        )}
+                        {msg.interpret && pendingConfirm?.msgId === msg.id && (
                           <div className="rounded-2xl border border-white/15 bg-white/8 p-4 space-y-3 backdrop-blur-sm">
                             <div className="flex items-center justify-between">
                               <span className="inline-flex items-center gap-1.5 rounded-full bg-violet-500/20 px-2.5 py-1 text-[11px] font-medium text-violet-300">
                                 <Zap size={10} />
-                                {msg.skillResult.task_type === "immediate" ? msg.skillResult.skill : msg.skillResult.task_type}
+                                {msg.interpret.tasks.length === 1 ? "Confirm action" : `Confirm ${msg.interpret.tasks.length} actions`}
                               </span>
-                              <button onClick={() => { updateMessage(msg.id, { skillResult: undefined, text: "Cancelled." }); setPendingSkill(null); }} className="text-white/40 hover:text-white/80 transition"><X size={14} /></button>
+                              <button
+                                onClick={() => {
+                                  updateMessage(msg.id, { interpret: undefined, text: "Cancelled." });
+                                  setPendingConfirm(null);
+                                }}
+                                className="text-white/40 hover:text-white/80 transition"
+                              >
+                                <X size={14} />
+                              </button>
                             </div>
-                            <p className="text-sm text-white/80 leading-relaxed">{msg.skillResult.confirmation_message}</p>
-                            {msg.skillResult.task_type === "compound" && (
-                              <ol className="space-y-1">
-                                {msg.skillResult.steps.map((s, i) => (
-                                  <li key={i} className="flex items-start gap-2 text-xs text-white/60">
-                                    <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-violet-500/20 text-violet-300 font-bold">{i + 1}</span>
-                                    {s.description}
-                                  </li>
-                                ))}
-                              </ol>
-                            )}
-                            <AgentPinInput onConfirm={async (pin) => await confirmSkill(msg.id, msg.skillResult!, pin)} />
+                            <p className="text-sm text-white/80 leading-relaxed">{msg.interpret.combined_confirmation_message}</p>
+                            <div className="space-y-2">
+                              {msg.interpret.tasks.map((task, i) => (
+                                <AgentTaskRow key={i} task={task} index={i} total={msg.interpret!.tasks.length} />
+                              ))}
+                            </div>
+                            <AgentPinInput
+                              requiresPin={msg.interpret.requires_pin !== false}
+                              onConfirm={async (pin) => await runConfirm(msg.id, msg.interpret!, pin)}
+                            />
                           </div>
                         )}
                       </div>
@@ -1388,18 +1539,35 @@ function AgentTab({ arcName }: { arcName: string | null }) {
                 ref={inputRef}
                 value={input}
                 onChange={(e) => { setInput(e.target.value); const el = e.target; el.style.height = "auto"; el.style.height = `${Math.min(el.scrollHeight, 160)}px`; }}
-                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); if (!interpreting && !pendingSkill && input.trim()) handleSend(); } }}
+                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); if (!interpreting && !pendingConfirm && input.trim()) handleSend(); } }}
                 rows={1}
                 placeholder="Tell your agent what to do…"
-                disabled={interpreting || !!pendingSkill}
+                disabled={interpreting || !!pendingConfirm}
                 className="block w-full resize-none rounded-t-2xl bg-transparent px-4 pt-3.5 pb-2 text-sm text-white placeholder-white/30 outline-none disabled:opacity-50"
               />
               <div className="flex items-center justify-between px-3 pb-3 pt-1">
                 <span className="text-[11px] text-white/30">Actions require your agent PIN</span>
-                <button onClick={handleSend} disabled={interpreting || !!pendingSkill || !input.trim()}
-                  className="flex h-8 w-8 items-center justify-center rounded-full bg-violet-600 text-white transition hover:bg-violet-500 disabled:cursor-not-allowed disabled:bg-white/15 disabled:text-white/30">
-                  {interpreting ? <Loader2 size={14} className="animate-spin" /> : <ArrowUp size={14} />}
-                </button>
+                <div className="flex items-center gap-1.5">
+                  <MicButton
+                    onTranscript={(text) => {
+                      const next = input.trim() ? `${input.trimEnd()} ${text}` : text;
+                      setInput(next);
+                      requestAnimationFrame(() => {
+                        const el = inputRef.current;
+                        if (!el) return;
+                        el.style.height = "auto";
+                        el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+                        el.focus();
+                      });
+                    }}
+                    disabled={interpreting || !!pendingConfirm}
+                    sizeClass="h-8 w-8"
+                  />
+                  <button onClick={handleSend} disabled={interpreting || !!pendingConfirm || !input.trim()}
+                    className="flex h-8 w-8 items-center justify-center rounded-full bg-violet-600 text-white transition hover:bg-violet-500 disabled:cursor-not-allowed disabled:bg-white/15 disabled:text-white/30">
+                    {interpreting ? <Loader2 size={14} className="animate-spin" /> : <ArrowUp size={14} />}
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -1464,16 +1632,102 @@ function ThinkingDots() {
   );
 }
 
-function AgentPinInput({ onConfirm }: { onConfirm: (pin: string) => Promise<void> }) {
+/**
+ * Friendly summary of any V3 Trigger. Mirrors the helpers in
+ * app/agent/page.tsx — kept inline here so the wallet-shell file can
+ * stay self-contained.
+ */
+function triggerLabelForShell(t: Trigger): string {
+  if (t.type === "now") return "Run now";
+  if (t.type === "time") {
+    const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    if (t.schedule === "daily") return "Every day";
+    if (t.schedule === "weekly") return `Every ${dayNames[t.day_of_week ?? 1]}`;
+    if (t.schedule === "monthly") {
+      if (t.last_day_of_month) return "Last day of every month";
+      return `Day ${t.day_of_month ?? 1} of every month`;
+    }
+    return t.schedule;
+  }
+  if (t.type === "price") return `When ${t.asset} ${t.direction} $${t.threshold}`;
+  if (t.type === "balance_above") return `When balance > $${t.threshold_usdc}`;
+  return t.conditions.map((c) => triggerLabelForShell(c as Trigger)).join(" + ");
+}
+
+/**
+ * One row inside the dark-navy ConfirmCard — used by AgentTab to render
+ * each Task in the V3 batch.
+ */
+function AgentTaskRow({ task, index, total }: { task: Task; index: number; total: number }) {
+  return (
+    <div className="rounded-xl border border-white/10 bg-white/5 px-3 py-2.5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[11px] font-medium text-violet-300/80">
+          {triggerLabelForShell(task.trigger)}
+          {task.execution_mode === "repeat" && (
+            <span className="ml-1.5 rounded-full bg-white/10 px-1.5 py-0.5 text-[10px] text-white/60">
+              repeats
+            </span>
+          )}
+        </span>
+        {total > 1 && (
+          <span className="text-[10px] font-mono text-white/35">{index + 1}/{total}</span>
+        )}
+      </div>
+      <p className="mt-1 text-sm leading-snug text-white/85">{task.confirmation_message}</p>
+      {task.steps.length > 1 && (
+        <ol className="mt-2 space-y-0.5 text-[11px] text-white/55">
+          {task.steps.map((s, i) => (
+            <li key={i} className="flex gap-1.5">
+              <span className="font-mono text-white/35">{i + 1}.</span>
+              <span>{s.description}</span>
+            </li>
+          ))}
+        </ol>
+      )}
+    </div>
+  );
+}
+
+function AgentPinInput({
+  onConfirm,
+  requiresPin = true,
+}: {
+  onConfirm: (pin: string) => Promise<void>;
+  /** When false, render a single Confirm button — no PIN field, no validation. */
+  requiresPin?: boolean;
+}) {
   const [pin, setPin] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   async function submit() {
-    if (!/^\d{4,8}$/.test(pin)) { setError("Enter your 4–8 digit agent PIN"); return; }
+    if (requiresPin && !/^\d{4,8}$/.test(pin)) { setError("PIN must be 4–8 digits."); return; }
     setLoading(true); setError("");
-    try { await onConfirm(pin); }
-    catch (e) { setError(e instanceof Error ? e.message : "Confirmation failed"); setLoading(false); }
+    try { await onConfirm(requiresPin ? pin : ""); }
+    catch (e) {
+      setError(friendlyError(e, "Confirmation failed. Please try again."));
+      setLoading(false);
+    }
   }
+
+  // No-PIN path: just a Confirm button. Used for read-only / config /
+  // swap / withdraw-to-self batches where the server's batchRequiresPin
+  // returned false.
+  if (!requiresPin) {
+    return (
+      <div className="space-y-2">
+        {error && <p className="text-xs text-red-400">{error}</p>}
+        <button
+          onClick={submit}
+          disabled={loading}
+          className="flex w-full items-center justify-center gap-1.5 rounded-xl bg-violet-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-violet-500 disabled:opacity-50"
+        >
+          {loading ? <Loader2 size={14} className="animate-spin" /> : <><Check size={13} />Confirm</>}
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-2">
       {error && <p className="text-xs text-red-400">{error}</p>}
@@ -1783,10 +2037,14 @@ function PoliciesTab() {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ pin: cancelPin, policyId: cancelModal.policyId }),
       });
-      const data = await res.json();
-      if (!res.ok) { setCancelError(data.error ?? "Cancel failed"); }
-      else { setCancelModal(null); setCancelPin(""); await load(); }
-    } catch (e) { setCancelError(e instanceof Error ? e.message : "Network error"); }
+      if (!res.ok) {
+        setCancelError(await friendlyApiError(res, "Couldn't cancel that automation. Please try again."));
+      } else {
+        setCancelModal(null); setCancelPin(""); await load();
+      }
+    } catch (e) {
+      setCancelError(friendlyError(e, "Network hiccup — check your connection and try again."));
+    }
     finally { setCancelLoading(false); }
   }
 

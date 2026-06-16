@@ -1,22 +1,32 @@
 /**
- * POST /api/agent/confirm-policy
+ * POST /api/agent/confirm-policy   (V3 — multi-task batch)
  *
- * The single execution gate for all agent skills.
+ * The single execution gate for all confirmed agent intents. Replaces
+ * the V2 task_type-discriminated body with a uniform `tasks: Task[]`
+ * array — one PIN unlocks the whole batch.
  *
- * Responsibilities (only):
- *   L1 — Verify DotArc JWT session (requireAgentSession)
- *   L2 — Verify agent wallet ownership (DB lookup by supabaseUserId)
- *   L3 — Verify agent PIN + enforce lockout
- *   Build SkillContext → delegate to skillRegistry[skill].execute()
+ * Body:
+ *   { pin: string, tasks: Task[] }     // Task is from lib/agent-types.ts
  *
- * All skill logic lives in lib/skills/<skill-name>.ts.
- * This route has zero knowledge of what each skill does.
+ * Per-task dispatch:
+ *   - trigger.type === "now"   → executePlan(steps, ctx) — runs immediately
+ *   - any other trigger        → CREATE_POLICY skill — stores as agent_policies row
  *
- * Body: { pin: string, skill: string, params: Record<string, unknown> }
+ * Failure semantics: best-effort. Tasks run sequentially inside the
+ * user lock. If task 2 fails, tasks 1 (already complete) stay applied —
+ * Circle transfers can't be rolled back, so all-or-nothing is a lie.
+ * The caller receives a result entry per task with ok/error, in order.
+ *
+ * Layered security (unchanged):
+ *   L1 — DotArc JWT session
+ *   L2 — Agent wallet ownership
+ *   L3 — Agent PIN + lockout
+ *   L4 — Per-user serialization (withUserLock) for fund-affecting batches
  */
 
 import { NextResponse } from "next/server";
 import { requireAgentSession, enforceAgentGate, getAgentBalance } from "@/lib/agent";
+import { CircleUnavailableError } from "@/lib/circle";
 import { verifyAgentPinOrThrow } from "@/lib/agent-pin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { createSupabaseServiceClient } from "@/lib/supabase/service";
@@ -24,427 +34,170 @@ import { claimIdempotency, finalizeIdempotency } from "@/lib/agent-idempotency";
 import { logSkillExecution } from "@/lib/agent-audit";
 import { withUserLock } from "@/lib/agent-lock";
 import { skillRegistry } from "@/lib/skills";
+import { batchRequiresPin } from "@/lib/skills/pin-policy";
 import type { SkillContext } from "@/lib/skills";
 import { resolveRecipient } from "@/lib/ans";
-import type { PlanStep } from "@/lib/agent";
+import { recordSendHabit } from "@/lib/memory";
+import type { Task, PlanStep } from "@/lib/agent-types";
 import crypto from "node:crypto";
 
 export const runtime = "nodejs";
 
-export async function POST(req: Request) {
-  const traceId = crypto.randomUUID();
+// ── Types ─────────────────────────────────────────────────────────────
 
-  // ── L1: DotArc JWT session ────────────────────────────────────────
-  let agentSession: Awaited<ReturnType<typeof requireAgentSession>>;
-  try {
-    agentSession = await requireAgentSession();
-    await enforceAgentGate(agentSession.supabaseUserId);
-  } catch (res) {
-    return res as Response;
-  }
-
-  const { session, supabaseUserId } = agentSession;
-
-  let body: {
-    pin?: unknown;
-    task_type?: unknown;
-    skill?: unknown;
-    params?: unknown;
-    steps?: unknown;
-    schedule?: unknown;
-    condition?: unknown;
-    action?: unknown;
-    trigger?: unknown;
-    execution_mode?: unknown;
-    stop_conditions?: unknown;
-  };
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
-  }
-
-  const pin       = String(body.pin        ?? "");
-  const taskType  = String(body.task_type ?? "");
-  const skill     = String(body.skill      ?? "");
-  const params    = (body.params ?? {}) as Record<string, unknown>;
-  const rawSteps  = Array.isArray(body.steps) ? body.steps as PlanStep[] : [];
-
-  // Backward-compat: old clients may send skill==="PLAN" without task_type
-  const isCompound = taskType === "compound" || skill === "PLAN";
-  const isRecurring = taskType === "recurring";
-  const isConditional = taskType === "conditional";
-  const isImmediate = taskType === "immediate" || (!taskType && !isCompound && !isRecurring && !isConditional);
-
-  console.log(`[agent/confirm] trace=${traceId} user=${supabaseUserId} taskType=${taskType || "immediate"} skill=${skill || "-"}`);
-
-  if (!isImmediate && !isCompound && !isRecurring && !isConditional) {
-    console.warn(`[agent/confirm] trace=${traceId} unknown_task_type=${taskType}`);
-    return NextResponse.json({ error: `Unknown task_type: ${taskType}` }, { status: 400 });
-  }
-
-  // ── Resolve handler early — fail fast for unknown skills ──────────
-  const handler = (isImmediate && skill) ? skillRegistry[skill] : null;
-  if (isImmediate && skill && !handler) {
-    console.warn(`[agent/confirm] trace=${traceId} unknown_skill=${skill}`);
-    return NextResponse.json({ error: `Unknown skill: ${skill}` }, { status: 400 });
-  }
-  if (isCompound && rawSteps.length === 0) {
-    console.warn(`[agent/confirm] trace=${traceId} empty_compound`);
-    return NextResponse.json({ error: "compound task requires at least one step" }, { status: 400 });
-  }
-  if (isCompound && rawSteps.length > 3) {
-    console.warn(`[agent/confirm] trace=${traceId} compound_too_long steps=${rawSteps.length}`);
-    return NextResponse.json({ error: "compound task exceeds maximum of 3 steps" }, { status: 400 });
-  }
-  if (isCompound) {
-    for (const step of rawSteps) {
-      if (!skillRegistry[step.skill]) {
-        console.warn(`[agent/confirm] trace=${traceId} unknown_step_skill=${step.skill}`);
-        return NextResponse.json({ error: `Unknown skill in step: ${step.skill}` }, { status: 400 });
-      }
+type TaskResult =
+  | {
+      ok: true;
+      kind: "executed" | "policy";
+      task_index: number;
+      result: Record<string, unknown>;
+      steps?: StepResult[];
     }
-  }
-  if ((isRecurring || isConditional) && !body.action && !body.steps) {
-    console.warn(`[agent/confirm] trace=${traceId} missing_action_or_steps`);
-    return NextResponse.json({ error: "Recurring/conditional task requires action or steps" }, { status: 400 });
-  }
+  | {
+      ok: false;
+      kind: "executed" | "policy";
+      task_index: number;
+      error: string;
+      steps?: StepResult[];
+    };
 
-  const supabase = await createSupabaseServerClient();
+type StepResult = {
+  step: number;
+  description: string;
+  ok: boolean;
+  result?: unknown;
+  error?: string;
+};
 
-  // ── L2: agent wallet ownership ────────────────────────────────────
-  const { data: agentWallet } = await supabase
-    .from("agent_wallets")
-    .select("circle_wallet_id, circle_wallet_address, balance_cache_usdc, balance_cache_at")
-    .eq("user_id", supabaseUserId)
-    .maybeSingle();
+type PlanRunResult =
+  | { ok: true; steps: StepResult[]; lastResult: Record<string, unknown> }
+  | { ok: false; error: string; steps: StepResult[] };
 
-  if (!agentWallet) {
-    return NextResponse.json({ error: "Agent wallet not activated" }, { status: 400 });
-  }
-  // Stable non-null alias — the nested runCriticalSection function below
-  // doesn't preserve TS narrowing from the outer scope.
-  const wallet = agentWallet;
+// ── Body validation ───────────────────────────────────────────────────
 
-  // ── Pre-flight balance check (before PIN) ────────────────────────
-  const affectsFunds = isCompound
-    ? true
-    : (isRecurring || isConditional)
-      ? false // policies don't move money now; cron does later
-      : handler!.affectsFunds;
-  // SEND_TOKEN amount is denominated in the token (EURC/cirBTC), not USDC.
-  // Skip the USDC pre-flight check — the skill does its own token balance check.
-  const needsUsdcPreFlight = affectsFunds && skill !== "SEND_TOKEN";
-  if (needsUsdcPreFlight) {
-    const amount = isCompound ? extractPlanAmount(rawSteps) : extractAmountFromParams(params);
-    if (amount > 0) {
-      const cachedBalance = parseFloat(wallet.balance_cache_usdc ?? "0");
-      if (cachedBalance < amount) {
-        console.warn(`[agent/confirm] trace=${traceId} preflight_balance_fail needed=${amount} cached=${cachedBalance}`);
-        return NextResponse.json(
-          { error: `Insufficient balance. Your agent wallet has ${cachedBalance.toFixed(2)} USDC but this action needs ${amount.toFixed(2)} USDC. Top up from the Agent tab.` },
-          { status: 400 },
-        );
-      }
-    }
-  }
-
-  // ── Pre-flight: name resolution (before PIN) ─────────────────────
-  // Single skill: check params.recipient. Compound: check ALL steps' recipients.
-  if (affectsFunds) {
-    const recipientsToCheck: string[] = isCompound
-      ? rawSteps
-          .filter(s => s.skill === "SEND_USDC" || s.skill === "SEND_TOKEN")
-          .map(s => String(s.params.recipient ?? "").trim())
-          .filter(r => r && !r.startsWith("0x") && !r.startsWith("$prev"))
-      : (params.recipient && !String(params.recipient).startsWith("0x")
-          ? [String(params.recipient)]
-          : []);
-    for (const r of recipientsToCheck) {
-      try {
-        await resolveRecipient(r);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : `Could not resolve: ${r}`;
-        console.warn(`[agent/confirm] trace=${traceId} preflight_resolve_fail recipient="${r}" msg="${msg}"`);
-        return NextResponse.json({ error: msg }, { status: 400 });
-      }
-    }
-  }
-
-  // ── L3: PIN verification ────────────────────────────────────────────────────
-  const requiresPin = isCompound || isRecurring || isConditional
-    ? true
-    : handler!.requiresPin !== false;
-  if (requiresPin) {
-    try {
-      await verifyAgentPinOrThrow({ supabase, userId: supabaseUserId, pin });
-      console.log(`[agent/confirm] trace=${traceId} pin_verified`);
-    } catch (res) {
-      console.warn(`[agent/confirm] trace=${traceId} pin_failed`);
-      return res as Response;
-    }
-  }
-
-  // ── Critical section ──────────────────────────────────────────────
-  // For fund-affecting skills, serialize the balance-check → limit-check →
-  // PENDING-insert → Circle-call path per user. Without this, two concurrent
-  // requests can both pass the daily-cap check before either logs PENDING,
-  // and the user overshoots their limit. The lock is a no-op for read-only
-  // skills (CHECK_BALANCE, LIST_POLICIES, etc.).
-  return affectsFunds
-    ? withUserLock(supabaseUserId, () => runCriticalSection())
-    : runCriticalSection();
-
-  async function runCriticalSection(): Promise<Response> {
-  // ── L3.5: Live balance gateway check ──────────────────────────────
-  if (needsUsdcPreFlight) {
-    const amount = isCompound ? extractPlanAmount(rawSteps) : extractAmountFromParams(params);
-    if (amount > 0) {
-      const balanceStr = await getAgentBalance(wallet.circle_wallet_id);
-      const balance = parseFloat(balanceStr);
-      if (balance < amount) {
-        return NextResponse.json(
-          { error: `Insufficient balance. You have ${balance.toFixed(2)} USDC but need ${amount.toFixed(2)} USDC.` },
-          { status: 400 }
-        );
-      }
-    }
-  }
-
-  // ── Load spend limits ─────────────────────────────────────────────
-  const { data: limitsRow } = await supabase
-    .from("user_spend_limits")
-    .select("max_per_transaction_usdc, max_daily_usdc, max_weekly_usdc, max_monthly_usdc")
-    .eq("user_id", supabaseUserId)
-    .maybeSingle();
-
-  const limits = {
-    max_per_transaction_usdc: Number(limitsRow?.max_per_transaction_usdc ?? 50),
-    max_daily_usdc:           Number(limitsRow?.max_daily_usdc           ?? 100),
-    max_weekly_usdc:          Number(limitsRow?.max_weekly_usdc          ?? 300),
-    max_monthly_usdc:         Number(limitsRow?.max_monthly_usdc         ?? 500),
-  };
-
-  // ── Build SkillContext ────────────────────────────────────────────
-  const serviceSupabase = createSupabaseServiceClient();
-
-  // Count both COMPLETE and PENDING toward spend totals.
-  // PENDING rows represent in-flight tx that may still settle; counting them
-  // is the cheap defense against the limit-bypass race where two concurrent
-  // sends both read the same "spent" snapshot before either completes.
-  // FAILED rows are excluded — money never moved.
-  async function getSpentSince(since: Date): Promise<number> {
-    const { data } = await supabase
-      .from("agent_spend_log")
-      .select("amount_usdc")
-      .eq("user_id", supabaseUserId)
-      .in("status", ["PENDING", "COMPLETE"])
-      .gte("executed_at", since.toISOString());
-    return (data ?? []).reduce((acc, r) => acc + Number(r.amount_usdc), 0);
-  }
-
-  const ctx: SkillContext = {
-    supabase,
-    serviceSupabase,
-    supabaseUserId,
-    mainWalletAddress: session.walletAddress,
-    agentWallet: wallet,
-    limits,
-    params,
-    getSpentSince,
-  };
-
-  // ── Idempotency: claim before executing ───────────────────────────
-  // Skills that move money should always declare an idempotencyKey. If
-  // they don't (or return null), we just skip dedupe for that call.
-  // TTL: 60s for fund-affecting skills, 30s for everything else.
-  let idemKey: string | null = null;
-  if (isCompound) {
-    idemKey = rawSteps.map(s => `${s.skill}:${JSON.stringify(s.params)}`).join("|").slice(0, 512);
-  } else if (isImmediate && handler) {
-    idemKey = handler.idempotencyKey?.(params) ?? null;
-  } else if (isRecurring || isConditional) {
-    // Policies use CREATE_POLICY's idempotency logic
-    const cpHandler = skillRegistry["CREATE_POLICY"];
-    const cpParams = buildCreatePolicyParams(body);
-    idemKey = cpHandler.idempotencyKey?.(cpParams) ?? null;
-  }
-  const idemTtl = affectsFunds ? 90 : 30;
-
-  if (idemKey) {
-    const claim = await claimIdempotency({
-      service: serviceSupabase,
-      userId:   supabaseUserId,
-      skill,
-      key:      idemKey,
-      ttlSeconds: idemTtl,
-    });
-
-    if (claim.kind === "replay") {
-      // Audit the replay so dashboard shows it happened, but don't
-      // re-execute the skill. The cached httpStatus + result come from
-      // the original call.
-      await logSkillExecution({
-        service: serviceSupabase,
-        userId: supabaseUserId,
-        skill,
-        category: isCompound ? "TRANSFER" : (handler?.category ?? "POLICY"),
-        affectsFunds: isCompound ? true : (handler?.affectsFunds ?? false),
-        params,
-        ok: claim.httpStatus < 400,
-        httpStatus: claim.httpStatus,
-        durationMs: 0,
-        replayed: true,
-      });
-      return NextResponse.json(
-        { skill, result: claim.result, replayed: true },
-        { status: claim.httpStatus },
-      );
-    }
-    if (claim.kind === "in_flight") {
-      return NextResponse.json(
-        { error: "Identical request already in progress" },
-        { status: 409 },
-      );
-    }
-    if (claim.kind === "recent_failure") {
-      return NextResponse.json(
-        { error: "Identical request just failed; wait a moment before retrying" },
-        { status: 409 },
-      );
-    }
-    // claim.kind === "claimed" → fall through to execute
-  }
-
-  // ── Execute: compound (multi-step, one-time) ────────────────────
-  if (isCompound) {
-    const t0 = Date.now();
-    const planResult = await executePlan(rawSteps, ctx, serviceSupabase, supabaseUserId);
-    const planDuration = Date.now() - t0;
-    const planStatus = planResult.ok ? 200 : 400;
-    console.log(`[agent/confirm] trace=${traceId} compound ok=${planResult.ok} steps=${planResult.steps.length} duration=${planDuration}ms`);
-    if (idemKey) {
-      await finalizeIdempotency({
-        service: serviceSupabase, userId: supabaseUserId, skill, key: idemKey,
-        ok: planResult.ok, httpStatus: planStatus,
-        resultJson: planResult.ok ? { steps: planResult.steps } : null,
-      });
-    }
-    await logSkillExecution({
-      service: serviceSupabase, userId: supabaseUserId,
-      skill: "COMPOUND", category: "TRANSFER", affectsFunds: true,
-      params: {}, ok: planResult.ok, httpStatus: planStatus,
-      error: planResult.ok ? null : planResult.error,
-      durationMs: planDuration,
-    });
-    if (!planResult.ok) {
-      return NextResponse.json({ error: planResult.error, steps: planResult.steps }, { status: 400 });
-    }
-    return NextResponse.json({ task_type: "compound", steps: planResult.steps }, { status: 200 });
-  }
-
-  // ── Execute: recurring / conditional (stored as policy) ───────────
-  if (isRecurring || isConditional) {
-    const cpParams = buildCreatePolicyParams(body);
-    const policyCtx: SkillContext = { ...ctx, params: cpParams };
-    const cpHandler = skillRegistry["CREATE_POLICY"];
-    const startedAt = Date.now();
-    const output = await cpHandler.execute(policyCtx);
-    const durationMs = Date.now() - startedAt;
-    const httpStatus = output.ok ? (output.status ?? 200) : (output.status ?? 400);
-    console.log(`[agent/confirm] trace=${traceId} policy ok=${output.ok} type=${isRecurring ? "recurring" : "conditional"} duration=${durationMs}ms`);
-
-    if (idemKey) {
-      await finalizeIdempotency({
-        service: serviceSupabase, userId: supabaseUserId, skill, key: idemKey,
-        ok: output.ok, httpStatus,
-        resultJson: output.ok ? output.result : null,
-      });
-    }
-    await logSkillExecution({
-      service: serviceSupabase, userId: supabaseUserId,
-      skill: "CREATE_POLICY", category: "POLICY", affectsFunds: false,
-      params: cpParams, ok: output.ok, httpStatus,
-      error: output.ok ? null : output.error,
-      durationMs,
-    });
-    if (!output.ok) {
-      return NextResponse.json({ error: output.error }, { status: httpStatus });
-    }
-    return NextResponse.json({ task_type: isRecurring ? "recurring" : "conditional", result: output.result }, { status: httpStatus });
-  }
-
-  // ── Execute: immediate (single skill) ─────────────────────────────
-  const startedAt = Date.now();
-  const output = await handler!.execute(ctx);
-  const durationMs = Date.now() - startedAt;
-  const httpStatus = output.ok ? (output.status ?? 200) : (output.status ?? 400);
-  console.log(`[agent/confirm] trace=${traceId} immediate skill=${skill} ok=${output.ok} duration=${durationMs}ms`);
-
-  // ── Persist outcome to idempotency cache (best-effort) ────────────
-  if (idemKey) {
-    await finalizeIdempotency({
-      service: serviceSupabase,
-      userId: supabaseUserId,
-      skill,
-      key: idemKey,
-      ok: output.ok,
-      httpStatus,
-      resultJson: output.ok ? output.result : null,
-    });
-  }
-
-  // ── Audit log (best-effort, never blocks response) ────────────────
-  await logSkillExecution({
-    service: serviceSupabase,
-    userId: supabaseUserId,
-    skill,
-    category: handler!.category,
-    affectsFunds: handler!.affectsFunds,
-    params,
-    ok: output.ok,
-    httpStatus,
-    error: output.ok ? null : output.error,
-    durationMs,
-  });
-
-  if (!output.ok) {
-    return NextResponse.json({ error: output.error }, { status: httpStatus });
-  }
-  return NextResponse.json({ task_type: "immediate", skill, result: output.result }, { status: httpStatus });
-  } // end runCriticalSection
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-// ── helpers ─────────────────────────────────────────────────────────
-
 /**
- * Extract the numeric USDC amount from skill params for pre-flight balance checks.
- * Returns 0 for "all" or unparseable amounts (skills handle those at runtime).
+ * Validate the incoming `tasks` array shape just deep enough to safely
+ * dispatch. Per-skill param validation already happens inside each
+ * skill's handler — we don't duplicate it here.
  */
+function validateTasksShape(
+  tasks: unknown,
+): { ok: true; tasks: Task[] } | { ok: false; error: string } {
+  if (!Array.isArray(tasks) || tasks.length === 0) {
+    return { ok: false, error: "tasks must be a non-empty array" };
+  }
+  if (tasks.length > 5) {
+    return { ok: false, error: "tasks array exceeds maximum batch size of 5" };
+  }
+  for (let i = 0; i < tasks.length; i++) {
+    const t = tasks[i];
+    if (!isPlainObject(t)) {
+      return { ok: false, error: `Task ${i + 1} is not an object` };
+    }
+    const trig = t.trigger as Record<string, unknown> | undefined;
+    if (!trig || typeof trig.type !== "string") {
+      return { ok: false, error: `Task ${i + 1}: trigger.type is required` };
+    }
+    if (!Array.isArray(t.steps) || t.steps.length === 0 || t.steps.length > 3) {
+      return { ok: false, error: `Task ${i + 1}: steps must be an array of length 1–3` };
+    }
+    const stepsArr = t.steps as unknown[];
+    for (let j = 0; j < stepsArr.length; j++) {
+      const s = stepsArr[j];
+      if (!isPlainObject(s) || typeof s.skill !== "string" || !isPlainObject(s.params)) {
+        return { ok: false, error: `Task ${i + 1} step ${j + 1}: invalid shape` };
+      }
+    }
+    if (t.execution_mode !== "once" && t.execution_mode !== "repeat") {
+      return { ok: false, error: `Task ${i + 1}: execution_mode must be 'once' or 'repeat'` };
+    }
+  }
+  return { ok: true, tasks: tasks as Task[] };
+}
+
+// ── Pre-flight helpers ────────────────────────────────────────────────
+
 function extractAmountFromParams(params: Record<string, unknown>): number {
   if (params.amount === "all") return 0;
   const raw = Number(params.amount ?? 0);
-  if (!isFinite(raw) || raw <= 0) return 0;
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
   return raw;
 }
 
+/**
+ * USDC requirement for a sequence of steps. Mirrors the amount-tracking
+ * rules in lib/skills/create-policy.ts so pre-flight numbers match
+ * what the cron / executor will actually enforce.
+ */
 function extractPlanAmount(steps: PlanStep[]): number {
   return steps.reduce((total, step) => {
+    // Only skills that draw USDC out of the agent wallet up front gate on
+    // balance. Each such skill declares requiresBalanceCheck=true and its
+    // `params.amount` is denominated in USDC (SEND_USDC, WITHDRAW,
+    // BRIDGE_USDC). Everything else — SET_LIMIT, GET_PRICE, IKNOW,
+    // LIST_POLICIES, CREATE_POLICY, SEND_TOKEN (non-USDC unit), SWAP_USDC
+    // (checked in-skill) — leaves the flag false so its numeric params are
+    // never mistaken for an upfront USDC spend.
+    const handler = skillRegistry[step.skill];
+    if (!handler?.requiresBalanceCheck) return total;
     const raw = step.params.amount;
-    // $prev references are only known at runtime — skip
     if (typeof raw === "string" && raw.startsWith("$prev")) return total;
-    // SEND_TOKEN: amount is in the token (EURC, cirBTC) — NOT USDC — skip
-    if (step.skill === "SEND_TOKEN") return total;
-    // SWAP_USDC: amount is in tokenIn — only USDC-in swaps count toward USDC balance
-    if (step.skill === "SWAP_USDC") {
-      const tokenIn = String(step.params.tokenIn ?? "USDC").toUpperCase();
-      if (tokenIn !== "USDC") return total;
-    }
-    // SEND_USDC, BRIDGE_USDC, PAY_X402 — amount is always USDC
     return total + extractAmountFromParams(step.params);
   }, 0);
 }
 
+/**
+ * Sum of upfront USDC required across every "now" task's steps. Policy
+ * tasks (non-"now" triggers) don't draw funds at creation — the cron
+ * does that later — so we exclude them here.
+ */
+function totalUpfrontUsdc(tasks: Task[]): number {
+  return tasks.reduce((acc, t) => {
+    if (t.trigger.type !== "now") return acc;
+    return acc + extractPlanAmount(t.steps);
+  }, 0);
+}
+
+/**
+ * Collect every recipient identifier across all "now" tasks' SEND_USDC
+ * / SEND_TOKEN steps. Used for an early ANS-resolution sanity check —
+ * we'd rather fail before the user types the PIN than after.
+ *
+ * Policy tasks resolve recipients inside CREATE_POLICY itself, so we
+ * skip them here.
+ */
+function collectRecipientsForResolveCheck(tasks: Task[]): string[] {
+  const out: string[] = [];
+  for (const t of tasks) {
+    if (t.trigger.type !== "now") continue;
+    for (const s of t.steps) {
+      if (s.skill !== "SEND_USDC" && s.skill !== "SEND_TOKEN") continue;
+      const r = String(s.params.recipient ?? "").trim();
+      if (!r || r.startsWith("0x") || r.startsWith("$prev")) continue;
+      out.push(r);
+    }
+  }
+  return out;
+}
+
+/**
+ * True if the batch contains at least one fund-affecting task — used to
+ * decide whether to acquire the per-user serialization lock.
+ */
+function batchAffectsFunds(tasks: Task[]): boolean {
+  return tasks.some((t) => t.trigger.type === "now");
+}
+
+// ── $prev resolution ──────────────────────────────────────────────────
+
+/**
+ * Resolve any "$prev.foo" references in a step's params using the
+ * previous step's result. Returns a shallow copy.
+ */
 function resolvePrevRefs(
   params: Record<string, unknown>,
   prev: Record<string, unknown>,
@@ -465,9 +218,15 @@ function resolvePrevRefs(
   );
 }
 
-type StepResult = { step: number; description: string; ok: boolean; result?: unknown; error?: string };
-type PlanRunResult = { ok: true; steps: StepResult[] } | { ok: false; error: string; steps: StepResult[] };
+// ── Sequential plan executor ──────────────────────────────────────────
 
+/**
+ * Execute an ordered list of PlanSteps within a single task. On failure,
+ * stops at the failing step and surfaces a message that distinguishes
+ * "nothing moved" from "step N succeeded but step N+1 failed" — important
+ * for trust + UX, since on partial success the user's tokens may be in
+ * an intermediate state (e.g. swapped but not yet sent).
+ */
 async function executePlan(
   steps: PlanStep[],
   baseCtx: SkillContext,
@@ -478,7 +237,7 @@ async function executePlan(
   let prevResult: Record<string, unknown> = {};
 
   for (let i = 0; i < steps.length; i++) {
-    const step    = steps[i];
+    const step = steps[i];
     const handler = skillRegistry[step.skill];
     if (!handler) {
       return { ok: false, error: `Unknown skill at step ${i + 1}: ${step.skill}`, steps: stepResults };
@@ -497,23 +256,24 @@ async function executePlan(
     const output = await handler.execute(stepCtx);
 
     await logSkillExecution({
-      service:      serviceSupabase,
+      service: serviceSupabase,
       userId,
-      skill:        step.skill,
-      category:     handler.category,
+      skill: step.skill,
+      category: handler.category,
       affectsFunds: handler.affectsFunds,
-      params:       resolvedParams,
-      ok:           output.ok,
-      httpStatus:   output.ok ? 200 : 400,
-      error:        output.ok ? null : output.error,
-      durationMs:   Date.now() - t0,
+      params: resolvedParams,
+      ok: output.ok,
+      httpStatus: output.ok ? 200 : 400,
+      error: output.ok ? null : output.error,
+      durationMs: Date.now() - t0,
     });
 
     if (!output.ok) {
-      const done = stepResults.filter(r => r.ok).length;
-      const msg = done > 0
-        ? `Step ${i + 1} failed: ${output.error}. Step${done > 1 ? "s" : ""} 1–${done} completed — tokens are safe in your agent wallet.`
-        : `Step ${i + 1} failed: ${output.error}. No tokens have moved.`;
+      const done = stepResults.filter((r) => r.ok).length;
+      const msg =
+        done > 0
+          ? `Step ${i + 1} failed: ${output.error}. Step${done > 1 ? "s" : ""} 1–${done} completed — tokens are safe in your agent wallet.`
+          : `Step ${i + 1} failed: ${output.error}. No tokens have moved.`;
       stepResults.push({ step: i + 1, description: step.description, ok: false, error: output.error });
       return { ok: false, error: msg, steps: stepResults };
     }
@@ -522,41 +282,464 @@ async function executePlan(
     stepResults.push({ step: i + 1, description: step.description, ok: true, result: output.result });
   }
 
-  return { ok: true, steps: stepResults };
+  return { ok: true, steps: stepResults, lastResult: prevResult };
+}
+
+// ── Per-task dispatcher ───────────────────────────────────────────────
+
+/**
+ * Build a stable idempotency key for a single Task. Coarse on purpose —
+ * enough to deduplicate accidental double-submits but not so tight that
+ * the user can't legitimately re-issue the same intent.
+ */
+function computeTaskIdemKey(task: Task): string {
+  const stepsKey = task.steps
+    .map((s) => `${s.skill}:${JSON.stringify(s.params)}`)
+    .join("|");
+  return `T:${task.trigger.type}:${task.execution_mode}:${stepsKey}`.slice(0, 512);
 }
 
 /**
- * Translate V2 recurring / conditional task format into the legacy
- * CREATE_POLICY params that the CreatePolicy skill expects.
+ * Dispatch a single Task — either run-now (executePlan) or persist as a
+ * policy (CREATE_POLICY skill). Idempotency, audit logging, and result
+ * shaping happen here so the outer route stays a thin loop.
  */
-function buildCreatePolicyParams(body: {
-  task_type?: unknown;
-  schedule?: unknown;
-  schedule_params?: unknown;
-  trigger?: unknown;
-  action?: unknown;
-  steps?: unknown;
-  execution_mode?: unknown;
-  stop_conditions?: unknown;
-  confirmation_message?: unknown;
-}): Record<string, unknown> {
-  const executionMode = String(body.execution_mode ?? "repeat");
-  const stopConditions = Array.isArray(body.stop_conditions) ? body.stop_conditions : [];
-  const description = String(body.confirmation_message ?? "");
-  const action = body.action as Record<string, unknown> | undefined;
-  const steps = Array.isArray(body.steps) ? body.steps : undefined;
+async function dispatchTask(args: {
+  task: Task;
+  taskIndex: number;
+  baseCtx: SkillContext;
+  serviceSupabase: ReturnType<typeof createSupabaseServiceClient>;
+  userId: string;
+  traceId: string;
+}): Promise<TaskResult> {
+  const { task, taskIndex, baseCtx, serviceSupabase, userId, traceId } = args;
+  const isNow = task.trigger.type === "now";
+  const auditSkill = !isNow
+    ? "CREATE_POLICY"
+    : task.steps.length > 1
+      ? "COMPOUND"
+      : task.steps[0].skill;
 
-  if (body.task_type === "recurring") {
-    const schedule = String(body.schedule ?? "");
-    const scheduleParams = body.schedule_params as Record<string, unknown> | undefined;
-    const trigger: Record<string, unknown> = { type: "time", frequency: schedule };
-    if (scheduleParams?.day_of_week !== undefined) trigger.day_of_week = scheduleParams.day_of_week;
-    if (scheduleParams?.day_of_month !== undefined) trigger.day_of_month = scheduleParams.day_of_month;
-    if (scheduleParams?.last_day_of_month === true) trigger.last_day_of_month = true;
-    return { trigger, action, steps, execution_mode: executionMode, stop_conditions: stopConditions, description };
+  const idemKey = computeTaskIdemKey(task);
+  const idemTtl = isNow ? 90 : 30;
+
+  if (idemKey) {
+    const claim = await claimIdempotency({
+      service: serviceSupabase,
+      userId,
+      skill: auditSkill,
+      key: idemKey,
+      ttlSeconds: idemTtl,
+    });
+    if (claim.kind === "replay") {
+      await logSkillExecution({
+        service: serviceSupabase,
+        userId,
+        skill: auditSkill,
+        category: !isNow ? "POLICY" : "TRANSFER",
+        affectsFunds: isNow,
+        params: { taskIndex },
+        ok: claim.httpStatus < 400,
+        httpStatus: claim.httpStatus,
+        durationMs: 0,
+        replayed: true,
+      });
+      return claim.httpStatus < 400
+        ? {
+            ok: true,
+            kind: isNow ? "executed" : "policy",
+            task_index: taskIndex,
+            result: (claim.result ?? {}) as Record<string, unknown>,
+          }
+        : {
+            ok: false,
+            kind: isNow ? "executed" : "policy",
+            task_index: taskIndex,
+            error: "Replay of previously failed task",
+          };
+    }
+    if (claim.kind === "in_flight") {
+      return {
+        ok: false,
+        kind: isNow ? "executed" : "policy",
+        task_index: taskIndex,
+        error: "Identical task already in progress",
+      };
+    }
+    if (claim.kind === "recent_failure") {
+      return {
+        ok: false,
+        kind: isNow ? "executed" : "policy",
+        task_index: taskIndex,
+        error: "Identical task just failed; wait a moment before retrying",
+      };
+    }
+    // claim.kind === "claimed" → fall through
   }
 
-  // conditional
-  const trigger = body.trigger as Record<string, unknown> | undefined;
-  return { trigger, action, steps, execution_mode: executionMode, stop_conditions: stopConditions, description };
+  // ── Run-now path ─────────────────────────────────────────────────
+  if (isNow) {
+    const t0 = Date.now();
+    const planResult = await executePlan(task.steps, baseCtx, serviceSupabase, userId);
+    const durationMs = Date.now() - t0;
+    const httpStatus = planResult.ok ? 200 : 400;
+    console.log(
+      `[agent/confirm] trace=${traceId} task=${taskIndex} run-now ok=${planResult.ok} steps=${planResult.steps.length} duration=${durationMs}ms`,
+    );
+
+    if (idemKey) {
+      await finalizeIdempotency({
+        service: serviceSupabase,
+        userId,
+        skill: auditSkill,
+        key: idemKey,
+        ok: planResult.ok,
+        httpStatus,
+        resultJson: planResult.ok ? { steps: planResult.steps } : null,
+      });
+    }
+    await logSkillExecution({
+      service: serviceSupabase,
+      userId,
+      skill: auditSkill,
+      category: "TRANSFER",
+      affectsFunds: true,
+      params: { taskIndex, stepCount: task.steps.length },
+      ok: planResult.ok,
+      httpStatus,
+      error: planResult.ok ? null : planResult.error,
+      durationMs,
+    });
+
+    if (!planResult.ok) {
+      return {
+        ok: false,
+        kind: "executed",
+        task_index: taskIndex,
+        error: planResult.error,
+        steps: planResult.steps,
+      };
+    }
+    const result =
+      task.steps.length === 1 ? planResult.lastResult : { steps: planResult.steps };
+    return {
+      ok: true,
+      kind: "executed",
+      task_index: taskIndex,
+      result,
+      steps: task.steps.length > 1 ? planResult.steps : undefined,
+    };
+  }
+
+  // ── Policy-create path ───────────────────────────────────────────
+  const cpHandler = skillRegistry["CREATE_POLICY"];
+  const policyCtx: SkillContext = {
+    ...baseCtx,
+    params: {
+      task,
+      description: task.confirmation_message,
+    },
+  };
+  const t0 = Date.now();
+  const output = await cpHandler.execute(policyCtx);
+  const durationMs = Date.now() - t0;
+  const httpStatus = output.ok ? output.status ?? 201 : output.status ?? 400;
+  console.log(
+    `[agent/confirm] trace=${traceId} task=${taskIndex} policy ok=${output.ok} trigger=${task.trigger.type} duration=${durationMs}ms`,
+  );
+
+  if (idemKey) {
+    await finalizeIdempotency({
+      service: serviceSupabase,
+      userId,
+      skill: "CREATE_POLICY",
+      key: idemKey,
+      ok: output.ok,
+      httpStatus,
+      resultJson: output.ok ? output.result : null,
+    });
+  }
+  await logSkillExecution({
+    service: serviceSupabase,
+    userId,
+    skill: "CREATE_POLICY",
+    category: "POLICY",
+    affectsFunds: false,
+    params: { taskIndex, triggerType: task.trigger.type },
+    ok: output.ok,
+    httpStatus,
+    error: output.ok ? null : output.error,
+    durationMs,
+  });
+
+  if (!output.ok) {
+    return { ok: false, kind: "policy", task_index: taskIndex, error: output.error };
+  }
+  return { ok: true, kind: "policy", task_index: taskIndex, result: output.result };
+}
+
+// ── Memory: record send habits (Layer B) ─────────────────────────────
+
+/**
+ * After a batch runs, persist "who the user pays" facts for completed
+ * SEND_USDC / SEND_TOKEN steps. Best-effort and fully isolated: any
+ * failure is swallowed so it can never affect the user's response.
+ *
+ * Pulls the recipient address from the skill's RESULT (authoritative,
+ * post-resolution) and the arc name from the original step params.
+ */
+async function recordSendHabits(
+  service: ReturnType<typeof createSupabaseServiceClient>,
+  userId: string,
+  tasks: Task[],
+  results: TaskResult[],
+): Promise<void> {
+  const writes: Array<Promise<unknown>> = [];
+
+  for (const r of results) {
+    if (!r.ok || r.kind !== "executed") continue;
+    const task = tasks[r.task_index];
+    if (!task) continue;
+
+    // (step, output) pairs: single-step uses r.result; multi-step uses r.steps.
+    const pairs: Array<{ step: PlanStep; out: Record<string, unknown> }> = [];
+    if (task.steps.length === 1 && isPlainObject(r.result)) {
+      pairs.push({ step: task.steps[0], out: r.result });
+    } else if (r.steps) {
+      r.steps.forEach((s, idx) => {
+        if (s.ok && isPlainObject(s.result) && task.steps[idx]) {
+          pairs.push({ step: task.steps[idx], out: s.result });
+        }
+      });
+    }
+
+    for (const { step, out } of pairs) {
+      if (step.skill !== "SEND_USDC" && step.skill !== "SEND_TOKEN") continue;
+      const address = String(out.recipientAddress ?? "").trim();
+      if (!address) continue;
+      const rawRecipient = typeof step.params.recipient === "string" ? step.params.recipient : "";
+      const arcName = rawRecipient && !rawRecipient.startsWith("0x") ? rawRecipient : undefined;
+      const token = step.skill === "SEND_USDC" ? "USDC" : String(out.token ?? step.params.token ?? "").toUpperCase() || undefined;
+      const amountUsdc = step.skill === "SEND_USDC" ? Number(out.amountUsdc ?? step.params.amount) || undefined : undefined;
+      writes.push(recordSendHabit(service, userId, { address, arcName, token, amountUsdc }));
+    }
+  }
+
+  if (writes.length === 0) return;
+  try {
+    await Promise.allSettled(writes);
+  } catch {
+    // never throws — recordSendHabit already swallows its own errors
+  }
+}
+
+// ── Route handler ─────────────────────────────────────────────────────
+
+export async function POST(req: Request) {
+  const traceId = crypto.randomUUID();
+
+  // L1: DotArc JWT session
+  let agentSession: Awaited<ReturnType<typeof requireAgentSession>>;
+  try {
+    agentSession = await requireAgentSession();
+    await enforceAgentGate(agentSession.supabaseUserId);
+  } catch (res) {
+    return res as Response;
+  }
+  const { session, supabaseUserId } = agentSession;
+
+  // Body
+  let body: { pin?: unknown; tasks?: unknown };
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+  }
+
+  const pin = String(body.pin ?? "");
+  const shape = validateTasksShape(body.tasks);
+  if (!shape.ok) {
+    console.warn(`[agent/confirm] trace=${traceId} bad_tasks_shape: ${shape.error}`);
+    return NextResponse.json({ error: shape.error }, { status: 400 });
+  }
+  const tasks = shape.tasks;
+
+  console.log(
+    `[agent/confirm] trace=${traceId} user=${supabaseUserId} tasks=${tasks.length} triggers=${tasks.map((t) => t.trigger.type).join(",")}`,
+  );
+
+  // Up-front: resolve each step's skill against the registry so we fail
+  // fast on typos instead of partway through the batch.
+  for (let i = 0; i < tasks.length; i++) {
+    for (let j = 0; j < tasks[i].steps.length; j++) {
+      const sk = tasks[i].steps[j].skill;
+      if (!skillRegistry[sk]) {
+        return NextResponse.json(
+          { error: `Task ${i + 1} step ${j + 1}: unknown skill '${sk}'` },
+          { status: 400 },
+        );
+      }
+    }
+  }
+
+  const supabase = await createSupabaseServerClient();
+
+  // L2: agent wallet ownership
+  const { data: agentWallet } = await supabase
+    .from("agent_wallets")
+    .select("circle_wallet_id, circle_wallet_address, balance_cache_usdc, balance_cache_at")
+    .eq("user_id", supabaseUserId)
+    .maybeSingle();
+
+  if (!agentWallet) {
+    return NextResponse.json({ error: "Agent wallet not activated" }, { status: 400 });
+  }
+  const wallet = agentWallet;
+
+  // ── Pre-flight: cached balance check across the batch ────────────
+  const upfrontUsdc = totalUpfrontUsdc(tasks);
+  if (upfrontUsdc > 0) {
+    const cachedBalance = parseFloat(wallet.balance_cache_usdc ?? "0");
+    if (cachedBalance < upfrontUsdc) {
+      console.warn(
+        `[agent/confirm] trace=${traceId} preflight_balance_fail need=${upfrontUsdc} cached=${cachedBalance}`,
+      );
+      return NextResponse.json(
+        {
+          error: `Insufficient balance. Your agent wallet has ${cachedBalance.toFixed(2)} USDC but this batch needs ${upfrontUsdc.toFixed(2)} USDC. Top up from the Agent tab.`,
+        },
+        { status: 400 },
+      );
+    }
+  }
+
+  // ── Pre-flight: ANS resolution for run-now SEND steps ────────────
+  for (const r of collectRecipientsForResolveCheck(tasks)) {
+    try {
+      await resolveRecipient(r);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : `Could not resolve: ${r}`;
+      console.warn(`[agent/confirm] trace=${traceId} preflight_resolve_fail "${r}" msg="${msg}"`);
+      return NextResponse.json({ error: msg }, { status: 400 });
+    }
+  }
+
+  // L3: PIN verification — only when at least one step in the batch
+  // requires it. Read-only / config / withdraw-to-self / in-place swap
+  // skills declare requiresPin=false and skip this gate entirely so the
+  // user isn't asked for a PIN to e.g. check their balance.
+  const needsPin = batchRequiresPin(tasks, session.walletAddress);
+  if (needsPin) {
+    try {
+      await verifyAgentPinOrThrow({ supabase, userId: supabaseUserId, pin });
+      console.log(`[agent/confirm] trace=${traceId} pin_verified`);
+    } catch (res) {
+      console.warn(`[agent/confirm] trace=${traceId} pin_failed`);
+      return res as Response;
+    }
+  } else {
+    console.log(`[agent/confirm] trace=${traceId} pin_skipped (no outward step in batch)`);
+  }
+
+  const affectsFunds = batchAffectsFunds(tasks);
+  return affectsFunds
+    ? withUserLock(supabaseUserId, () => runBatch())
+    : runBatch();
+
+  async function runBatch(): Promise<Response> {
+    // L3.5: live-balance gateway check (only once, not per task — the
+    // upfront sum already rolls all "now" tasks together)
+    if (upfrontUsdc > 0) {
+      let balance: number;
+      try {
+        balance = parseFloat(await getAgentBalance(wallet.circle_wallet_id));
+      } catch (err) {
+        // Circle is down / timed out — fail fast and friendly rather than
+        // hanging or surfacing a raw 500. No money has moved.
+        const msg =
+          err instanceof CircleUnavailableError
+            ? err.message
+            : "Couldn't reach Circle to confirm your balance. No money has moved — please try again in a moment.";
+        return NextResponse.json({ error: msg }, { status: 503 });
+      }
+      if (balance < upfrontUsdc) {
+        return NextResponse.json(
+          {
+            error: `Insufficient balance. You have ${balance.toFixed(2)} USDC but this batch needs ${upfrontUsdc.toFixed(2)} USDC.`,
+          },
+          { status: 400 },
+        );
+      }
+    }
+
+    // Spend limits — loaded once for the whole batch.
+    const { data: limitsRow } = await supabase
+      .from("user_spend_limits")
+      .select("max_per_transaction_usdc, max_daily_usdc, max_weekly_usdc, max_monthly_usdc")
+      .eq("user_id", supabaseUserId)
+      .maybeSingle();
+
+    const limits = {
+      max_per_transaction_usdc: Number(limitsRow?.max_per_transaction_usdc ?? 50),
+      max_daily_usdc: Number(limitsRow?.max_daily_usdc ?? 100),
+      max_weekly_usdc: Number(limitsRow?.max_weekly_usdc ?? 300),
+      max_monthly_usdc: Number(limitsRow?.max_monthly_usdc ?? 500),
+    };
+
+    const serviceSupabase = createSupabaseServiceClient();
+
+    async function getSpentSince(since: Date): Promise<number> {
+      const { data } = await supabase
+        .from("agent_spend_log")
+        .select("amount_usdc")
+        .eq("user_id", supabaseUserId)
+        .in("status", ["PENDING", "COMPLETE"])
+        .gte("executed_at", since.toISOString());
+      return (data ?? []).reduce((acc, r) => acc + Number(r.amount_usdc), 0);
+    }
+
+    const baseCtx: SkillContext = {
+      supabase,
+      serviceSupabase,
+      supabaseUserId,
+      mainWalletAddress: session.walletAddress,
+      agentWallet: wallet,
+      limits,
+      params: {}, // per-task params injected inside dispatchTask
+      getSpentSince,
+    };
+
+    // Sequential dispatch — each task awaits the previous so a SWAP
+    // landing before a SEND in the next task observes the new balance.
+    const results: TaskResult[] = [];
+    for (let i = 0; i < tasks.length; i++) {
+      const r = await dispatchTask({
+        task: tasks[i],
+        taskIndex: i,
+        baseCtx,
+        serviceSupabase,
+        userId: supabaseUserId,
+        traceId,
+      });
+      results.push(r);
+      // We do NOT abort on failure — best-effort continues to the next
+      // task. Already-completed transfers can't be undone, and the user
+      // sees per-task outcomes in the response.
+    }
+
+    // Layer B memory: record who the user paid (best-effort, non-fatal).
+    await recordSendHabits(serviceSupabase, supabaseUserId, tasks, results);
+
+    const successCount = results.filter((r) => r.ok).length;
+    const httpStatus = successCount === tasks.length ? 200 : successCount === 0 ? 400 : 207;
+    return NextResponse.json(
+      {
+        results,
+        ok: successCount === tasks.length,
+        successCount,
+        totalCount: tasks.length,
+      },
+      { status: httpStatus },
+    );
+  }
 }

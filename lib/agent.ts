@@ -14,7 +14,7 @@ import "server-only";
 import crypto from "node:crypto";
 import bcrypt from "bcryptjs";
 import { Interface, parseUnits } from "ethers";
-import { circleDev, waitForCircleTx } from "@/lib/circle";
+import { circleDev, waitForCircleTx, circleRead, circleWrite } from "@/lib/circle";
 import { requireSession, type Session } from "@/lib/auth";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 
@@ -22,39 +22,24 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 
 import type {
   SkillName,
-  TaskType,
   PlanStep,
-  PolicyAction,
-  ImmediateTaskResult,
-  CompoundTaskResult,
-  RecurringTaskResult,
-  ConditionalTaskResult,
-  AnyTaskResult,
   SpendLimits,
   AgentTokenBalance,
   ActivePolicy,
-  // backward-compat aliases
-  SkillResult,
-  PlanResult,
-  AnySkillResult,
+  Task,
+  Trigger,
+  InterpretResult,
 } from "@/lib/agent-types";
 
 export type {
   SkillName,
-  TaskType,
   PlanStep,
-  PolicyAction,
-  ImmediateTaskResult,
-  CompoundTaskResult,
-  RecurringTaskResult,
-  ConditionalTaskResult,
-  AnyTaskResult,
   SpendLimits,
   AgentTokenBalance,
   ActivePolicy,
-  SkillResult,
-  PlanResult,
-  AnySkillResult,
+  Task,
+  Trigger,
+  InterpretResult,
 };
 
 export type AgentSession = {
@@ -200,41 +185,14 @@ function getHmacSecret(): string {
   return s;
 }
 
-// ── HMAC v1 (legacy — narrow fields) ──────────────────────────────────
-// Kept for backward compatibility with policies created before the
-// orchestration model. These rows have hmac_version = 1.
-
-export type LegacyHmacFields = {
-  userId: string;
-  policyId: string;
-  skill: string;
-  recipientAddress: string | null;
-  amountUsdc: number | null;
-  frequency: string | null;
-  createdAt: string;
-};
-
-function signLegacyHmac(fields: LegacyHmacFields): string {
-  const canonical = [
-    fields.userId,
-    fields.policyId,
-    fields.skill,
-    fields.recipientAddress ?? "",
-    fields.amountUsdc?.toString() ?? "",
-    fields.frequency ?? "",
-    fields.createdAt,
-  ].join("|");
-
-  return crypto
-    .createHmac("sha256", getHmacSecret())
-    .update(canonical)
-    .digest("hex");
-}
-
 // ── HMAC v2 (orchestration — full policy intent) ──────────────────────
 // Signs everything that, if tampered, would change behaviour:
 // trigger, action, execution_mode, cooldown, stop_conditions.
 // These rows have hmac_version = 2.
+//
+// Note: HMAC v1 (legacy RECURRING_PAYMENT) was removed on 2026-06-07
+// along with the RECURRING_PAYMENT skill. The cron route now rejects any
+// row with hmac_version !== 2.
 
 export type OrchestrationHmacFields = {
   userId: string;
@@ -247,10 +205,22 @@ export type OrchestrationHmacFields = {
   cooldownSeconds: number;
   stopConditions: Array<Record<string, unknown>>;
   createdAt: string;
+  /**
+   * V3: optional array of plan steps for compound policies.
+   * - NULL/undefined for simple single-action policies (legacy V2 shape).
+   * - Populated when action_skill === "COMPOUND".
+   * Forwards-compatible: when omitted, JSON.stringify drops the key, so
+   * existing V2 rows continue to verify against their stored hashes.
+   */
+  steps?: Array<Record<string, unknown>> | null;
 };
 
 function signOrchestrationHmac(fields: OrchestrationHmacFields): string {
-  const canonical = JSON.stringify({
+  // Canonical payload — keys must always appear in the same order so the
+  // hash is deterministic. We only include `steps` when it's a non-empty
+  // array, which keeps backwards compatibility with V2 rows that never
+  // had this key in their canonical input.
+  const canonical: Record<string, unknown> = {
     userId: fields.userId,
     policyId: fields.policyId,
     actionSkill: fields.actionSkill,
@@ -261,39 +231,40 @@ function signOrchestrationHmac(fields: OrchestrationHmacFields): string {
     cooldownSeconds: fields.cooldownSeconds,
     stopConditions: fields.stopConditions,
     createdAt: fields.createdAt,
-  });
+  };
+  if (fields.steps && fields.steps.length > 0) {
+    canonical.steps = fields.steps;
+  }
 
   return crypto
     .createHmac("sha256", getHmacSecret())
-    .update(canonical)
+    .update(JSON.stringify(canonical))
     .digest("hex");
 }
 
 // ── Public dispatchers ──────────────────────────────────────────────
+//
+// V2 (orchestration) is the only supported HMAC version. The `version`
+// parameter is retained on the public signatures for forward-compat —
+// future incompatible changes will introduce a v3 here.
 
-/** Sign a policy. Pick the right HMAC version automatically. */
+/** Sign a v2 (orchestration) policy. */
 export function signPolicyHmac(
-  fields: LegacyHmacFields | (OrchestrationHmacFields & { version: 2 })
+  fields: OrchestrationHmacFields & { version: 2 }
 ): string {
-  if ("version" in fields && fields.version === 2) {
-    const { version: _version, ...rest } = fields;
-    void _version;
-    return signOrchestrationHmac(rest);
-  }
-  return signLegacyHmac(fields as LegacyHmacFields);
+  const { version: _version, ...rest } = fields;
+  void _version;
+  return signOrchestrationHmac(rest);
 }
 
 /** Verify a stored policy HMAC. Returns false (not throws) on mismatch. */
 export function verifyPolicyHmac(
-  fields: LegacyHmacFields | OrchestrationHmacFields,
+  fields: OrchestrationHmacFields,
   storedHmac: string,
-  version: number = 1
+  version: number = 2
 ): boolean {
-  const expected =
-    version === 2
-      ? signOrchestrationHmac(fields as OrchestrationHmacFields)
-      : signLegacyHmac(fields as LegacyHmacFields);
-
+  if (version !== 2) return false; // v1 was removed with RECURRING_PAYMENT
+  const expected = signOrchestrationHmac(fields);
   const expectedBuf = Buffer.from(expected, "hex");
   const storedBuf = Buffer.from(storedHmac, "hex");
   if (expectedBuf.length !== storedBuf.length) return false;
@@ -335,7 +306,9 @@ export async function createAgentWalletInCircle(): Promise<{
  */
 export async function getAgentBalance(agentWalletId: string): Promise<string> {
   if (!circleDev) throw new Error("Circle dev client not configured");
-  const res = await circleDev.getWalletTokenBalance({ id: agentWalletId });
+  const res = await circleRead("getWalletTokenBalance(agent)", () =>
+    circleDev!.getWalletTokenBalance({ id: agentWalletId }),
+  );
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const balances: any[] = res.data?.tokenBalances ?? [];
   const usdcAddress = process.env.NEXT_PUBLIC_USDC_TOKEN_ADDRESS?.toLowerCase();
@@ -360,7 +333,9 @@ const DISPLAY_USD_RATES: Record<string, number> = {
 
 export async function getAgentAllBalances(agentWalletId: string): Promise<AgentTokenBalance[]> {
   if (!circleDev) throw new Error("Circle dev client not configured");
-  const res = await circleDev.getWalletTokenBalance({ id: agentWalletId });
+  const res = await circleRead("getWalletTokenBalance(agent-all)", () =>
+    circleDev!.getWalletTokenBalance({ id: agentWalletId }),
+  );
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const balances: any[] = res.data?.tokenBalances ?? [];
 
@@ -507,12 +482,14 @@ export async function executeAgentSendUsdc(args: {
     amountWei,
   ]) as `0x${string}`;
 
-  const txRes = await circleDev.createContractExecutionTransaction({
-    walletId: args.agentWalletId,
-    contractAddress: usdcAddress,
-    callData,
-    fee: { type: "level", config: { feeLevel: "MEDIUM" } },
-  });
+  const txRes = await circleWrite("createContractExecutionTransaction(agent-usdc)", () =>
+    circleDev!.createContractExecutionTransaction({
+      walletId: args.agentWalletId,
+      contractAddress: usdcAddress,
+      callData,
+      fee: { type: "level", config: { feeLevel: "MEDIUM" } },
+    }),
+  );
 
   const circleTxId = txRes.data?.id;
   if (!circleTxId) throw new Error("Circle returned no transaction id for agent send");
@@ -548,12 +525,14 @@ export async function executeAgentSendToken(args: {
     amountWeiBig.toString(),
   ]) as `0x${string}`;
 
-  const txRes = await circleDev.createContractExecutionTransaction({
-    walletId: args.agentWalletId,
-    contractAddress: args.tokenAddress,
-    callData,
-    fee: { type: "level", config: { feeLevel: "MEDIUM" } },
-  });
+  const txRes = await circleWrite("createContractExecutionTransaction(agent-token)", () =>
+    circleDev!.createContractExecutionTransaction({
+      walletId: args.agentWalletId,
+      contractAddress: args.tokenAddress,
+      callData,
+      fee: { type: "level", config: { feeLevel: "MEDIUM" } },
+    }),
+  );
 
   const circleTxId = txRes.data?.id;
   if (!circleTxId) throw new Error("Circle returned no transaction id for token send");
@@ -565,9 +544,6 @@ export async function executeAgentSendToken(args: {
 // ── Re-exports from agent-core (pure logic) ────────────────────────────
 
 export {
-  buildSystemPrompt,
-  validateTaskResult,
-  interpretInstruction,
   computeNextRun,
   checkSpendLimits,
   startOfDayUTC,

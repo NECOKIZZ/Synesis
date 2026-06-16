@@ -56,6 +56,11 @@ export const PayX402: SkillHandler = {
   category: "TRANSFER",
   version: 1,
   affectsFunds: true,
+  // No PIN: x402 payments are typically tiny machine-to-machine fees
+  // (sub-cent to a few cents) and the user's per-tx spend limit already
+  // gates the upper bound. Forcing a PIN every API call would defeat the
+  // automation use case.
+  requiresPin: false,
 
   idempotencyKey(params): string | null {
     const url = String(params.url ?? "").trim();

@@ -22,6 +22,12 @@ export const Withdraw: SkillHandler = {
   category: "TRANSFER",
   version: 1,
   affectsFunds: true,
+  // No PIN: withdraw moves USDC from agent → user's own main wallet.
+  // Funds never leave the user's control, so we don't gate on PIN.
+  requiresPin: false,
+  // Numeric amount is in USDC and draws from the agent wallet → balance gate.
+  // ("all" extracts as 0 in pre-flight and is sized live inside execute().)
+  requiresBalanceCheck: true,
 
   // Withdraw "all" is intentionally retryable (user might want to drain a
   // dust amount that arrived after the first call). Numeric amounts are
@@ -45,12 +51,26 @@ export const Withdraw: SkillHandler = {
     let amountUsdc: number;
     if (params.amount === "all") {
       const balanceStr = await getAgentBalance(agentWallet.circle_wallet_id);
-      amountUsdc = parseFloat(balanceStr);
-      if (amountUsdc <= 0) {
+      const balance = parseFloat(balanceStr);
+      if (!Number.isFinite(balance) || balance <= 0) {
         return { ok: false, error: "Agent wallet has no balance to withdraw", status: 400 };
       }
+      // Arc pays gas in USDC. Draining to zero leaves nothing to cover the
+      // withdraw transaction's OWN gas, so the transfer fails (this caused
+      // the "withdraw all" failures in stress testing). Keep a small reserve
+      // so "withdraw all" clears reliably.
+      const gasBuffer = Number(process.env.WITHDRAW_GAS_BUFFER_USDC ?? 0.1);
+      if (balance <= gasBuffer) {
+        return {
+          ok: false,
+          error:
+            `Your agent wallet holds ${balance.toFixed(2)} USDC — too low to cover the ` +
+            `~${gasBuffer} USDC gas reserve needed to withdraw. Nothing was moved.`,
+          status: 400,
+        };
+      }
       // Floor to 6 decimal places to avoid Circle rounding errors
-      amountUsdc = Math.floor(amountUsdc * 1_000_000) / 1_000_000;
+      amountUsdc = Math.floor((balance - gasBuffer) * 1_000_000) / 1_000_000;
     } else {
       const raw = Number(params.amount);
       if (isNaN(raw) || raw <= 0) {

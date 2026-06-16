@@ -28,7 +28,7 @@
 import { NextResponse } from "next/server";
 import crypto from "node:crypto";
 import { createSupabaseServiceClient } from "@/lib/supabase/service";
-import { readUsdcBalanceWei } from "@/lib/circle";
+import { readUsdcBalanceWei, getUserWallet } from "@/lib/circle";
 import { formatUnits } from "ethers";
 
 export const runtime = "nodejs";
@@ -58,7 +58,9 @@ type CircleTxState =
 
 interface CircleNotification {
   id: string;
-  state: CircleTxState;
+  /** Transaction events use `state`; challenge events use `status`. */
+  state?: CircleTxState;
+  status?: string;
   txHash?: string | null;
   amounts?: string[];
   destinationAddress?: string;
@@ -478,7 +480,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: true });
   }
 
-  const state = notification.state;
+  const state: CircleTxState = notification.state ?? "INITIATED";
   const txHash = notification.txHash ?? null;
   const amountStr = notification.amounts?.[0];
   const amountUsdc = amountStr ? parseFloat(amountStr) : null;
@@ -545,7 +547,43 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: true });
   }
 
-  // 6. Anything else — ack so Circle stops retrying, but log for triage.
-  console.log("[webhooks/circle] event ignored:", notificationType, state);
+  // 6. CHALLENGE events (onboarding PIN, send signing, etc.)
+  const isChallenge = !!notificationType?.startsWith("challenges.");
+  if (isChallenge && notification) {
+    const status = notification.status;
+    const challengeId = notification.id;
+    const userId = notification.userId;
+    console.log("[webhooks/circle] challenge:", { notificationType, challengeId, status, userId });
+
+    if (notificationType === "challenges.initialize" && status === "COMPLETE" && userId) {
+      // User finished the initial PIN setup. Try to fetch their wallet
+      // from Circle and update the profile so the next init-user call
+      // hits the FAST PATH.
+      try {
+        const wallet = await getUserWallet(userId);
+        if (wallet) {
+          const { error } = await supabase
+            .from("profiles")
+            .update({ wallet_address: wallet.address })
+            .eq("circle_user_id", userId)
+            .is("wallet_address", null);
+          if (error) {
+            console.error("[webhooks/circle] profile update failed:", error);
+          } else {
+            console.log("[webhooks/circle] profile updated with wallet for", userId);
+          }
+        } else {
+          console.warn("[webhooks/circle] no wallet found for", userId, "after challenge completion");
+        }
+      } catch (err) {
+        console.error("[webhooks/circle] wallet lookup failed:", err);
+      }
+    }
+
+    return NextResponse.json({ ok: true });
+  }
+
+  // 7. Anything else — ack so Circle stops retrying, but log for triage.
+  console.log("[webhooks/circle] event ignored:", notificationType, notification?.state, notification?.status);
   return NextResponse.json({ ok: true });
 }

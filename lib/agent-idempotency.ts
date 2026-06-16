@@ -17,8 +17,13 @@
  *   - If a fresh row already exists:
  *       COMPLETE → replay cached result + http status
  *       PENDING  → 409: another request is in flight
- *       FAILED   → 409: just failed, don't hammer
+ *       FAILED   → 409 (rare race only — see below)
  *   - If an EXPIRED row exists → atomically overwrite and proceed.
+ *
+ *   FAILED rows are expired immediately by finalizeIdempotency(), so a
+ *   legitimate retry after a failure proceeds instead of being blocked.
+ *   The "recent_failure" branch now only triggers in the narrow race where
+ *   a row is FAILED but finalize hasn't written the expiry yet.
  *
  * Storage: public.agent_idempotency (service-role writes only).
  *
@@ -153,12 +158,21 @@ export async function finalizeIdempotency(args: {
   const { service, userId, skill, key, ok, httpStatus, resultJson } = args;
   const fullKey = `${skill}:${key}`;
 
+  // On FAILURE, expire the row immediately so a legitimate retry isn't
+  // blocked by the "recent_failure" 409. A failed task moved no money
+  // (or, for self-withdraw, only to the user's own wallet), the per-skill
+  // balance/limit checks re-run on retry, and the Circle circuit breaker
+  // already prevents hammering a down provider. On SUCCESS we keep the
+  // existing TTL so genuine double-submits replay the cached result.
+  const failedExpiry = new Date().toISOString();
+
   const { error } = await service
     .from("agent_idempotency")
     .update({
       status: ok ? "COMPLETE" : "FAILED",
       result_json: ok ? resultJson : null,
       http_status: httpStatus,
+      ...(ok ? {} : { expires_at: failedExpiry }),
     })
     .eq("user_id", userId)
     .eq("idempotency_key", fullKey);

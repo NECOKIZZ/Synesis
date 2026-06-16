@@ -5,46 +5,100 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { useCircleWallet } from "../circle-wallet-context";
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
+import { friendlyError, friendlyApiError } from "@/lib/friendly-errors";
+import { buildConversationHistory } from "@/lib/agent-history";
+import { useSessionEndSummary } from "@/lib/memory/use-session-end-summary";
+import { MicButton } from "@/components/voice/MicButton";
+import { SpeakButton } from "@/components/voice/SpeakButton";
 import {
-  Send, Loader2, ArrowLeft, Check, X, AlertTriangle, RefreshCw,
-  Plus, ChevronDown, Sparkles, ArrowUp, List, Zap,
-  Wallet as WalletIcon, Shield, Repeat, Coins,
+  Send,
+  Loader2,
+  ArrowLeft,
+  Check,
+  X,
+  AlertTriangle,
+  RefreshCw,
+  Plus,
+  ChevronDown,
+  Sparkles,
+  ArrowUp,
+  List,
+  Zap,
+  Wallet as WalletIcon,
+  Shield,
+  Repeat,
+  Coins,
+  Clock,
+  TrendingUp,
 } from "lucide-react";
 
-// ── Types ────────────────────────────────────────────────────────────
+// ── V3 Types (mirror lib/agent-types.ts) ──────────────────────────────
 
-type SkillName =
-  | "SEND_USDC" | "CHECK_BALANCE" | "SET_LIMIT"
-  | "CANCEL_POLICY" | "WITHDRAW" | "CREATE_POLICY" | "LIST_POLICIES" | "UNKNOWN";
-
-type SkillResult = {
-  skill: SkillName;
+type PlanStep = {
+  skill: string;
   params: Record<string, unknown>;
+  description: string;
+};
+
+type Trigger =
+  | { type: "now" }
+  | {
+      type: "time";
+      schedule: "daily" | "weekly" | "monthly";
+      day_of_week?: number;
+      day_of_month?: number;
+      last_day_of_month?: boolean;
+    }
+  | { type: "price"; asset: "BTC" | "ETH" | "USDC"; direction: "above" | "below"; threshold: number }
+  | { type: "balance_above"; threshold_usdc: number }
+  | { type: "and"; conditions: Array<Exclude<Trigger, { type: "now" } | { type: "and" }>> };
+
+type Task = {
+  trigger: Trigger;
+  steps: PlanStep[];
+  execution_mode: "once" | "repeat";
+  stop_conditions?: Array<Record<string, unknown>>;
   confirmation_message: string;
-  requires_confirmation: boolean;
+};
+
+type InterpretResult = {
+  tasks: Task[];
+  combined_confirmation_message: string;
+  unknown_reason?: string;
+};
+
+type StepResult = {
+  step: number;
+  description: string;
+  ok: boolean;
+  result?: Record<string, unknown>;
+  error?: string;
+};
+
+type TaskResultResponse =
+  | { ok: true; kind: "executed" | "policy"; task_index: number; result: Record<string, unknown>; steps?: StepResult[] }
+  | { ok: false; kind: "executed" | "policy"; task_index: number; error: string; steps?: StepResult[] };
+
+type ConfirmResponse = {
+  results: TaskResultResponse[];
+  ok: boolean;
+  successCount: number;
+  totalCount: number;
 };
 
 type Message = {
   id: string;
   role: "user" | "agent" | "system";
   text: string;
-  skillResult?: SkillResult;
   pending?: boolean;
+  interpret?: InterpretResult;
 };
 
 type AgentStatus = {
   activated: boolean;
-  wallet?: {
-    address: string;
-    arcName: string | null;
-    balanceUsdc: string;
-  };
+  wallet?: { address: string; arcName: string | null; balanceUsdc: string };
   pinSet?: boolean;
-  limits?: {
-    max_per_transaction_usdc: number;
-    max_daily_usdc: number;
-    max_monthly_usdc: number;
-  };
+  limits?: { max_per_transaction_usdc: number; max_daily_usdc: number; max_monthly_usdc: number };
   policies?: Array<{
     id: string;
     active: boolean;
@@ -61,8 +115,6 @@ type AgentStatus = {
   }>;
 };
 
-// ── Suggestion chips (post-activation home state) ────────────────────
-
 type Suggestion = {
   label: string;
   prompt: string;
@@ -70,11 +122,11 @@ type Suggestion = {
 };
 
 const SUGGESTIONS: Suggestion[] = [
-  { label: "Send USDC",     prompt: "Send 5 USDC to ",                       Icon: Send },
-  { label: "Recurring",     prompt: "Pay 10 USDC to alice.arc every Friday", Icon: Repeat },
-  { label: "Balance",       prompt: "What's my agent balance?",              Icon: WalletIcon },
-  { label: "Set limit",     prompt: "Set my daily limit to 50 USDC",         Icon: Shield },
-  { label: "Smart suggest", prompt: "What can you help me automate?",        Icon: Sparkles },
+  { label: "Send USDC", prompt: "Send 5 USDC to ", Icon: Send },
+  { label: "Recurring", prompt: "Pay 10 USDC to alice.arc every Friday", Icon: Repeat },
+  { label: "Balance", prompt: "What's my agent balance?", Icon: WalletIcon },
+  { label: "Set limit", prompt: "Set my daily limit to 50 USDC", Icon: Shield },
+  { label: "Multi-task", prompt: "Send 5 USDC to maya.arc and pay 2 USDC to bob.arc every Friday", Icon: Sparkles },
 ];
 
 function timeGreeting(): string {
@@ -86,20 +138,92 @@ function timeGreeting(): string {
   return "Late night";
 }
 
-// ── Confirmation card (PIN entry inside the chat) ────────────────────
+// ── Trigger summary helpers ───────────────────────────────────────────
+
+function triggerLabel(t: Trigger): string {
+  if (t.type === "now") return "Run now";
+  if (t.type === "time") {
+    const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    if (t.schedule === "daily") return "Every day";
+    if (t.schedule === "weekly") return `Every ${dayNames[t.day_of_week ?? 1]}`;
+    if (t.schedule === "monthly") {
+      if (t.last_day_of_month) return "Last day of every month";
+      return `Day ${t.day_of_month ?? 1} of every month`;
+    }
+    return t.schedule;
+  }
+  if (t.type === "price") return `When ${t.asset} ${t.direction} $${t.threshold}`;
+  if (t.type === "balance_above") return `When balance > $${t.threshold_usdc}`;
+  return t.conditions.map((c) => triggerLabel(c as Trigger)).join(" + ");
+}
+
+function triggerIconFor(t: Trigger) {
+  if (t.type === "now") return Zap;
+  if (t.type === "time" || t.type === "and") return Clock;
+  if (t.type === "price") return TrendingUp;
+  return AlertTriangle;
+}
+
+// ── Single task summary row inside the ConfirmCard ────────────────────
+
+function TaskRow({ task, index, total }: { task: Task; index: number; total: number }) {
+  const Icon = triggerIconFor(task.trigger);
+  return (
+    <div className="rounded-xl border border-stone-150 bg-stone-50/60 px-3 py-2.5">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5 text-[11px] font-medium text-stone-600">
+          <Icon className="h-3 w-3" />
+          <span>{triggerLabel(task.trigger)}</span>
+          {task.execution_mode === "repeat" && (
+            <span className="rounded-full bg-stone-100 px-1.5 py-0.5 text-[10px] text-stone-500">
+              repeats
+            </span>
+          )}
+        </div>
+        {total > 1 && (
+          <span className="text-[10px] font-mono text-stone-400">{index + 1}/{total}</span>
+        )}
+      </div>
+      <p className="mt-1 text-sm leading-snug text-stone-800">{task.confirmation_message}</p>
+      {task.steps.length > 1 && (
+        <ol className="mt-2 space-y-0.5 text-[11px] text-stone-500">
+          {task.steps.map((s, i) => (
+            <li key={i} className="flex gap-1.5">
+              <span className="font-mono text-stone-400">{i + 1}.</span>
+              <span>{s.description}</span>
+            </li>
+          ))}
+        </ol>
+      )}
+    </div>
+  );
+}
+
+// ── ConfirmCard — one card, N task rows, single PIN ───────────────────
 
 function ConfirmCard({
-  result,
+  interpret,
   onConfirm,
   onDismiss,
 }: {
-  result: SkillResult;
+  interpret: InterpretResult;
   onConfirm: (pin: string) => void;
   onDismiss: () => void;
 }) {
   const [pin, setPin] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+
+  // Read-only single-task batches skip the PIN prompt and auto-confirm.
+  const isReadOnly =
+    interpret.tasks.length === 1 &&
+    interpret.tasks[0].steps.length === 1 &&
+    ["CHECK_BALANCE", "LIST_POLICIES", "IKNOW", "GET_PRICE"].includes(interpret.tasks[0].steps[0].skill);
+
+  useEffect(() => {
+    if (isReadOnly) void onConfirm("");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function submit() {
     if (!/^\d{4,8}$/.test(pin)) {
@@ -111,31 +235,19 @@ function ConfirmCard({
     try {
       await onConfirm(pin);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Confirmation failed");
+      setError(friendlyError(e, "Confirmation failed. Please try again."));
       setLoading(false);
     }
   }
 
-  const skillTone: Record<string, string> = {
-    SEND_USDC: "text-emerald-700 bg-emerald-50",
-    WITHDRAW: "text-amber-700 bg-amber-50",
-    SET_LIMIT: "text-blue-700 bg-blue-50",
-    CANCEL_POLICY: "text-red-700 bg-red-50",
-    CREATE_POLICY: "text-cyan-700 bg-cyan-50",
-    CHECK_BALANCE: "text-stone-700 bg-stone-100",
-  };
+  if (isReadOnly) return null;
 
   return (
-    <div className="max-w-md space-y-3 rounded-2xl border border-stone-200 bg-white p-4 shadow-sm">
+    <div className="max-w-lg space-y-3 rounded-2xl border border-stone-200 bg-white p-4 shadow-sm">
       <div className="flex items-start justify-between gap-2">
-        <span
-          className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-mono font-medium ${
-            skillTone[result.skill] ?? "text-stone-700 bg-stone-100"
-          }`}
-        >
-          <Zap className="h-3 w-3" />
-          {result.skill}
-        </span>
+        <p className="text-xs font-medium uppercase tracking-wider text-stone-500">
+          {interpret.tasks.length === 1 ? "Confirm action" : `Confirm ${interpret.tasks.length} actions`}
+        </p>
         <button
           onClick={onDismiss}
           className="text-stone-400 transition hover:text-stone-700"
@@ -144,9 +256,20 @@ function ConfirmCard({
           <X className="h-4 w-4" />
         </button>
       </div>
-      <p className="text-sm leading-relaxed text-stone-800">{result.confirmation_message}</p>
+
+      <p className="text-sm leading-relaxed text-stone-800">
+        {interpret.combined_confirmation_message}
+      </p>
+
+      <div className="space-y-2">
+        {interpret.tasks.map((task, i) => (
+          <TaskRow key={i} task={task} index={i} total={interpret.tasks.length} />
+        ))}
+      </div>
+
       {error && <p className="text-xs text-red-600">{error}</p>}
-      <div className="flex items-center gap-2">
+
+      <div className="flex items-center gap-2 pt-1">
         <input
           type="password"
           inputMode="numeric"
@@ -156,20 +279,145 @@ function ConfirmCard({
           onKeyDown={(e) => e.key === "Enter" && submit()}
           placeholder="Agent PIN"
           className="flex-1 rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-sm tracking-widest text-stone-900 placeholder-stone-400 outline-none transition focus:border-stone-400 focus:bg-white"
+          autoFocus
         />
         <button
           onClick={submit}
           disabled={loading || pin.length < 4}
           className="inline-flex items-center gap-1.5 rounded-xl bg-stone-900 px-3.5 py-2 text-sm font-medium text-white transition hover:bg-stone-800 disabled:opacity-50"
         >
-          {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : (<><Check className="h-4 w-4" /> Confirm</>)}
+          {loading ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : (
+            <>
+              <Check className="h-4 w-4" />
+              Confirm{interpret.tasks.length > 1 ? " all" : ""}
+            </>
+          )}
         </button>
       </div>
     </div>
   );
 }
 
-// ── Main page ────────────────────────────────────────────────────────
+// ── Result formatting per task ────────────────────────────────────────
+
+/**
+ * Render a friendly post-execution / post-policy-creation string for a
+ * single task's response. Errors and successes both flow through here so
+ * the chat reads consistently.
+ */
+function formatTaskResult(task: Task, r: TaskResultResponse): string {
+  if (!r.ok) return `✗ ${friendlyError(r.error, "That step couldn't be completed.")}`;
+
+  // Policy-create path
+  if (r.kind === "policy") {
+    const nextRun = r.result.nextRun as string | undefined;
+    const compound = r.result.compound === true;
+    const tail = nextRun
+      ? ` Next run: ${new Date(nextRun).toLocaleDateString()}.`
+      : "";
+    return `✓ ${compound ? "Compound " : ""}policy created.${tail}`;
+  }
+
+  // Run-now path
+  if (task.steps.length === 1) {
+    const single = task.steps[0];
+    const res = r.result;
+    switch (single.skill) {
+      case "SEND_USDC": {
+        const addr = String(res.recipientAddress ?? "");
+        const short = addr ? `${addr.slice(0, 8)}…${addr.slice(-4)}` : "recipient";
+        let line = `✓ Sent ${res.amountUsdc} USDC to ${short}`;
+        if (res.txHash) line += `\nTx: ${String(res.txHash).slice(0, 10)}…`;
+        return line;
+      }
+      case "WITHDRAW":
+        return `✓ Withdrew ${res.amountUsdc} USDC to your main wallet`;
+      case "SET_LIMIT":
+        return `✓ Updated ${res.updated} limit to $${res.amount} USDC`;
+      case "CANCEL_POLICY":
+        return `✓ Cancelled ${res.cancelledCount} polic${res.cancelledCount !== 1 ? "ies" : "y"}`;
+      case "CHECK_BALANCE":
+        return `Agent balance: ${res.balanceUsdc} USDC`;
+      case "SWAP_USDC":
+        return `✓ Swapped ${res.amountIn ?? res.amount} ${res.tokenIn ?? "USDC"} → ${res.amountOut ?? "?"} ${res.tokenOut ?? "?"}`;
+      case "SEND_TOKEN":
+        return `✓ Sent ${res.amount} ${res.tokenSymbol ?? "tokens"}`;
+      case "BRIDGE_USDC":
+        return `✓ Bridged ${res.amount} USDC`;
+      case "PAY_X402":
+        return `✓ Paid ${res.amount} USDC for ${res.label ?? "API call"}`;
+      case "GET_PRICE": {
+        const price = Number(res.priceUsd ?? 0);
+        const age = Number(res.ageSeconds ?? 0);
+        return `Current price of ${res.symbol}: $${price.toFixed(2)} (source: ${res.source}, ${age}s old)`;
+      }
+      case "IKNOW": {
+        const verdict = String(res?.verdict ?? "");
+        const stage = String(res?.stage ?? "");
+        const belief = String(res?.belief ?? "");
+        const market = res?.market as Record<string, unknown> | undefined;
+
+        // Show the market whenever the oracle found a match, even if
+        // success === false (e.g. critic unavailable).  The market
+        // data is still valid.
+        if (verdict === "MATCH" && market) {
+          const title = String(market.title ?? "");
+          const yesOdds = Number(market.yesOdds ?? 0);
+          const noOdds = Number(market.noOdds ?? 0);
+          const side = String(market.side ?? "");
+          const url = String(market.url ?? "");
+          const verdictReason = String(res?.verdictReason ?? "");
+          let msg = `You can make money off that opinion — check out this market:\n\n"${title}"`;
+          msg += `\nYes: ${yesOdds.toFixed(2)}  |  No: ${noOdds.toFixed(2)}`;
+          if (side) msg += `\nYour side: ${side.toUpperCase()}`;
+          if (verdictReason) msg += `\nWhy: ${verdictReason}`;
+          if (url) msg += `\n\n${url}`;
+          return msg;
+        }
+
+        if (stage === "broad_summary") {
+          const suggestions = Array.isArray(res?.suggestions)
+            ? (res.suggestions as Array<Record<string, unknown>>)
+            : [];
+          const lines = suggestions.map((s, i) =>
+            `${i + 1}. ${s.title} — Yes: ${Number(s.yesOdds ?? 0).toFixed(2)}, No: ${Number(s.noOdds ?? 0).toFixed(2)}`
+          );
+          return `That's a broad belief! Here are some related markets:\n${lines.join("\n")}\n\nReply with a number to pick one.`;
+        }
+
+        const success = res?.success === true;
+        if (!success) {
+          const suggestions = Array.isArray(res?.suggestions)
+            ? (res.suggestions as Array<Record<string, unknown>>)
+            : [];
+          if (suggestions.length > 0) {
+            const lines = suggestions.map((s, i) =>
+              `${i + 1}. ${s.title} — Yes: ${Number(s.yesOdds ?? 0).toFixed(2)}, No: ${Number(s.noOdds ?? 0).toFixed(2)}`
+            );
+            return `Hmm, I couldn't find an exact match for "${belief}". Here are the closest markets:\n${lines.join("\n")}\n\nReply with a number to pick one.`;
+          }
+          return `I couldn't find a prediction market for "${belief}". Try rephrasing with a clearer event.`;
+        }
+        return `Found a match for "${belief}" but market details were incomplete.`;
+      }
+      default:
+        return "✓ Done.";
+    }
+  }
+
+  // Compound task — one line per step
+  const steps = r.steps ?? [];
+  const lines = steps.map((s) =>
+    s.ok
+      ? `  ✓ ${s.description}`
+      : `  ✗ ${s.description}: ${friendlyError(s.error, "step failed")}`,
+  );
+  return `✓ Compound task complete:\n${lines.join("\n")}`;
+}
+
+// ── Main page ─────────────────────────────────────────────────────────
 
 export default function AgentPage() {
   const router = useRouter();
@@ -180,12 +428,13 @@ export default function AgentPage() {
     {
       id: "welcome",
       role: "agent",
-      text: "Hi! I'm your DotArc agent. Tell me what to do — send USDC, set up recurring payments, check your balance, or update your limits.",
+      text: "Hi! I'm your DotArc agent. Tell me what to do — and I can handle multiple things at once.",
     },
   ]);
   const [input, setInput] = useState("");
   const [interpreting, setInterpreting] = useState(false);
-  const [pendingSkill, setPendingSkill] = useState<{ msgId: string; result: SkillResult } | null>(null);
+  /** When non-null, the chat has an open confirmation card the user must address. */
+  const [pendingConfirm, setPendingConfirm] = useState<{ msgId: string; interpret: InterpretResult } | null>(null);
   const [tab, setTab] = useState<"chat" | "policies">("chat");
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -194,9 +443,8 @@ export default function AgentPage() {
     loadStatus();
   }, []);
 
-  // Realtime: webhooks update `agent_spend_log` and `agent_wallets` rows.
-  // Re-pull /api/agent/status on any change so balance + recent activity
-  // tick over without a manual reload.
+  // Realtime: balance + recent activity refresh when webhooks update
+  // agent_spend_log or agent_wallets.
   useEffect(() => {
     if (!session?.userId) return;
     const supabase = createSupabaseBrowserClient();
@@ -204,33 +452,28 @@ export default function AgentPage() {
       .channel(`agent-live-${session.userId}`)
       .on(
         "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "agent_spend_log",
-          filter: `user_id=eq.${session.userId}`,
-        },
-        () => { loadStatus(); }
+        { event: "*", schema: "public", table: "agent_spend_log", filter: `user_id=eq.${session.userId}` },
+        () => loadStatus(),
       )
       .on(
         "postgres_changes",
-        {
-          event: "UPDATE",
-          schema: "public",
-          table: "agent_wallets",
-          filter: `user_id=eq.${session.userId}`,
-        },
-        () => { loadStatus(); }
+        { event: "UPDATE", schema: "public", table: "agent_wallets", filter: `user_id=eq.${session.userId}` },
+        () => loadStatus(),
       )
       .subscribe();
-
-    return () => { supabase.removeChannel(channel); };
+    return () => {
+      supabase.removeChannel(channel);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session?.userId]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  // Layer C — fire a session-end summary on tab close / 10-min idle.
+  // Server-side gates on MEMWAL_ENABLED so this is safe to leave on.
+  useSessionEndSummary(messages);
 
   async function loadStatus() {
     setStatusLoading(true);
@@ -255,12 +498,15 @@ export default function AgentPage() {
     setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, ...update } : m)));
   }
 
+  // ── Send instruction → interpret → render confirm card ─────────────
   async function handleSend() {
     const instruction = input.trim();
     if (!instruction || interpreting) return;
     setInput("");
-    // Reset textarea height after submit.
     if (inputRef.current) inputRef.current.style.height = "auto";
+    // Layer A — capture prior turns BEFORE appending this one (setState is
+    // async, so `messages` here still excludes the new user message).
+    const history = buildConversationHistory(messages);
     addMessage({ role: "user", text: instruction });
 
     setInterpreting(true);
@@ -269,106 +515,98 @@ export default function AgentPage() {
     const res = await fetch("/api/agent/interpret", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ instruction }),
+      body: JSON.stringify({ instruction, history }),
     });
-
     setInterpreting(false);
 
     if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      updateMessage(thinkingId, { text: data.error ?? "Failed to interpret instruction", pending: false });
-      return;
-    }
-
-    const skillResult: SkillResult = await res.json();
-    console.log("[interpret] skillResult:", JSON.stringify(skillResult, null, 2));
-
-    if (skillResult.skill === "UNKNOWN") {
+      const friendly = await friendlyApiError(
+        res,
+        "I couldn't reach the assistant. Please try again.",
+      );
       updateMessage(thinkingId, {
-        text: String(skillResult.params.explanation ?? "I didn't understand that. Could you rephrase?"),
+        text: friendly,
         pending: false,
       });
       return;
     }
 
-    if (skillResult.skill === "CHECK_BALANCE") {
-      await confirmSkill(thinkingId, skillResult, "");
+    const interpret: InterpretResult = await res.json();
+    console.log("[interpret] result:", interpret);
+
+    if (interpret.tasks.length === 0) {
+      updateMessage(thinkingId, {
+        text: interpret.unknown_reason ?? "I didn't understand that. Could you rephrase?",
+        pending: false,
+      });
       return;
     }
 
-    // Show confirmation card
+    // Stash the result with the thinking message and open the ConfirmCard.
     updateMessage(thinkingId, {
-      text: skillResult.confirmation_message,
-      skillResult,
+      text: interpret.combined_confirmation_message,
+      interpret,
       pending: false,
     });
-    setPendingSkill({ msgId: thinkingId, result: skillResult });
+    setPendingConfirm({ msgId: thinkingId, interpret });
   }
 
-  async function confirmSkill(msgId: string, skillResult: SkillResult, pin: string) {
+  // ── PIN entered → POST batch to confirm-policy ─────────────────────
+  async function handleConfirm(pin: string) {
+    if (!pendingConfirm) return;
+    const { msgId, interpret } = pendingConfirm;
+
     const res = await fetch("/api/agent/confirm-policy", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pin, skill: skillResult.skill, params: skillResult.params }),
+      body: JSON.stringify({ pin, tasks: interpret.tasks }),
     });
 
-    const data = await res.json();
-    setPendingSkill(null);
+    setPendingConfirm(null);
 
-    if (!res.ok) {
+    let data: ConfirmResponse | { error?: string };
+    try {
+      data = await res.json();
+    } catch {
       updateMessage(msgId, {
-        skillResult: undefined,
-        text: data.error ?? "Action failed",
+        interpret: undefined,
+        text: "The server returned an unexpected response. Please try again.",
         pending: false,
       });
       return;
     }
 
-    const r = data.result;
-    let resultText = "";
-
-    switch (skillResult.skill) {
-      case "SEND_USDC":
-        resultText = `✓ Sent ${r.amountUsdc} USDC to ${r.recipientAddress.slice(0, 8)}…${r.recipientAddress.slice(-4)}`;
-        if (r.txHash) resultText += `\nTx: ${r.txHash.slice(0, 10)}…`;
-        break;
-      case "WITHDRAW":
-        resultText = `✓ Withdrew ${r.amountUsdc} USDC to your main wallet`;
-        await loadStatus();
-        break;
-      case "SET_LIMIT":
-        resultText = `✓ Updated ${r.updated} limit to $${r.amount} USDC`;
-        await loadStatus();
-        break;
-      case "CANCEL_POLICY":
-        resultText = `✓ Cancelled ${r.cancelledCount} polic${r.cancelledCount !== 1 ? "ies" : "y"}`;
-        await loadStatus();
-        break;
-      case "CREATE_POLICY":
-        resultText = `✓ Policy created. Next run: ${r.nextRun ? new Date(r.nextRun).toLocaleDateString() : "N/A"}`;
-        await loadStatus();
-        break;
-      case "CHECK_BALANCE":
-        console.log("[CHECK_BALANCE] data.result:", JSON.stringify(r, null, 2));
-        resultText = `Agent balance: ${r.balanceUsdc} USDC`;
-        break;
-      default:
-        resultText = "Done.";
+    // Hard error (no per-task results) — e.g. PIN failure, bad request.
+    if (!("results" in data)) {
+      updateMessage(msgId, {
+        interpret: undefined,
+        text: friendlyError(data.error, "That action couldn't be completed."),
+        pending: false,
+      });
+      return;
     }
 
-    updateMessage(msgId, { skillResult: undefined, text: resultText, pending: false });
+    // Per-task results: render each as its own line so partial-success
+    // states are readable.
+    const summary = data.results
+      .map((r) => formatTaskResult(interpret.tasks[r.task_index], r))
+      .join("\n\n");
+
+    updateMessage(msgId, { interpret: undefined, text: summary, pending: false });
+
+    // Refresh status if anything affected the user's policies / balance.
+    if (data.results.some((r) => r.ok)) {
+      await loadStatus();
+    }
   }
 
-  async function handleConfirm(pin: string) {
-    if (!pendingSkill) return;
-    await confirmSkill(pendingSkill.msgId, pendingSkill.result, pin);
+  function handleDismiss(msgId: string) {
+    updateMessage(msgId, { interpret: undefined, text: "Cancelled." });
+    setPendingConfirm(null);
   }
 
-  // ── Cancel policy ─────────────────────────────────────────────────
-  const [cancelModal, setCancelModal] = useState<{
-    policyId: string;
-    summary: string;
-  } | null>(null);
+  // ── Cancel policy modal ───────────────────────────────────────────
+  const [cancelModal, setCancelModal] = useState<{ policyId: string; summary: string } | null>(null);
   const [cancelPin, setCancelPin] = useState("");
   const [cancelLoading, setCancelLoading] = useState(false);
   const [cancelError, setCancelError] = useState("");
@@ -386,22 +624,23 @@ export default function AgentPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ pin: cancelPin, policyId: cancelModal.policyId }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setCancelError(data.error ?? "Cancel failed");
+        setCancelError(
+          friendlyError(data?.error, "Couldn't cancel that automation. Please try again."),
+        );
       } else {
         setCancelModal(null);
         setCancelPin("");
         await loadStatus();
       }
     } catch (e) {
-      setCancelError(e instanceof Error ? e.message : "Network error");
+      setCancelError(friendlyError(e, "Network hiccup — check your connection and try again."));
     } finally {
       setCancelLoading(false);
     }
   }
 
-  // Display name from .arc label → "alice.arc" → "Alice". Fallback "there".
   const firstName = useMemo(() => {
     const arc = status?.wallet?.arcName;
     if (arc) {
@@ -411,9 +650,7 @@ export default function AgentPage() {
     return "there";
   }, [status?.wallet?.arcName]);
 
-  // Empty home state: only the welcome message present and we're on chat tab.
-  const showHome =
-    tab === "chat" && messages.length <= 1 && messages[0]?.id === "welcome";
+  const showHome = tab === "chat" && messages.length <= 1 && messages[0]?.id === "welcome";
 
   function pickSuggestion(prompt: string) {
     setInput(prompt);
@@ -470,9 +707,7 @@ export default function AgentPage() {
               key={t}
               onClick={() => setTab(t)}
               className={`inline-flex items-center gap-1.5 rounded-full px-4 py-1.5 text-xs font-medium transition ${
-                tab === t
-                  ? "bg-white text-stone-900 shadow-sm"
-                  : "text-stone-500 hover:text-stone-800"
+                tab === t ? "bg-white text-stone-900 shadow-sm" : "text-stone-500 hover:text-stone-800"
               }`}
             >
               {t === "chat" ? <Send className="h-3 w-3" /> : <List className="h-3 w-3" />}
@@ -488,11 +723,7 @@ export default function AgentPage() {
       {tab === "chat" && (
         <>
           {showHome ? (
-            <HomeGreeting
-              greeting={timeGreeting()}
-              firstName={firstName}
-              onPick={pickSuggestion}
-            />
+            <HomeGreeting greeting={timeGreeting()} firstName={firstName} onPick={pickSuggestion} />
           ) : (
             <div className="mx-auto w-full max-w-3xl flex-1 overflow-y-auto px-4 py-6 sm:px-6">
               <div className="space-y-5">
@@ -502,12 +733,9 @@ export default function AgentPage() {
                     <MessageRow
                       key={msg.id}
                       msg={msg}
-                      isPending={pendingSkill?.msgId === msg.id}
+                      isPending={pendingConfirm?.msgId === msg.id}
                       onConfirm={handleConfirm}
-                      onDismiss={() => {
-                        updateMessage(msg.id, { skillResult: undefined, text: "Cancelled." });
-                        setPendingSkill(null);
-                      }}
+                      onDismiss={() => handleDismiss(msg.id)}
                     />
                   ))}
                 <div ref={bottomRef} />
@@ -515,7 +743,7 @@ export default function AgentPage() {
             </div>
           )}
 
-          {/* Input bar (always pinned at the bottom of the chat tab) */}
+          {/* Input bar */}
           <div className="sticky bottom-0 z-20 bg-gradient-to-t from-[#faf9f7] via-[#faf9f7] to-transparent px-4 pb-5 pt-3 sm:px-6 sm:pb-7">
             <div className="mx-auto w-full max-w-3xl">
               <ChatInput
@@ -523,7 +751,7 @@ export default function AgentPage() {
                 value={input}
                 onChange={setInput}
                 onSend={handleSend}
-                disabled={interpreting || !!pendingSkill}
+                disabled={interpreting || !!pendingConfirm}
                 interpreting={interpreting}
               />
               <p className="mt-2 text-center text-[11px] text-stone-400">
@@ -550,10 +778,7 @@ export default function AgentPage() {
           ) : (
             <div className="space-y-3">
               {status.policies.map((p) => (
-                <div
-                  key={p.id}
-                  className="space-y-2 rounded-2xl border border-stone-200 bg-white p-4"
-                >
+                <div key={p.id} className="space-y-2 rounded-2xl border border-stone-200 bg-white p-4">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
                       <span className="rounded-full bg-stone-100 px-2 py-0.5 text-[10px] font-mono font-medium text-stone-700">
@@ -657,7 +882,7 @@ export default function AgentPage() {
   );
 }
 
-// ── Greeting + suggestion chips (empty home state) ───────────────────
+// ── Greeting + suggestion chips ───────────────────────────────────────
 
 function HomeGreeting({
   greeting,
@@ -671,27 +896,15 @@ function HomeGreeting({
   return (
     <div className="mx-auto flex w-full max-w-2xl flex-1 flex-col items-center justify-center px-4 py-10 sm:py-16">
       <div className="flex items-center gap-3">
-        <Sparkles
-          className="h-7 w-7 sm:h-8 sm:w-8"
-          style={{ color: "#c25b3f" }}
-          aria-hidden
-        />
-        {/* suppressHydrationWarning: greeting is timezone-dependent and
-            differs between server (UTC) and client. Without this we trip
-            React #418 and the whole tree is regenerated on mount. */}
+        <Sparkles className="h-7 w-7 sm:h-8 sm:w-8" style={{ color: "#c25b3f" }} aria-hidden />
         <h1
           suppressHydrationWarning
           className="text-3xl font-medium tracking-tight text-stone-800 sm:text-[2.5rem]"
-          style={{
-            fontFamily:
-              "ui-serif, Georgia, Cambria, 'Times New Roman', Times, serif",
-          }}
+          style={{ fontFamily: "ui-serif, Georgia, Cambria, 'Times New Roman', Times, serif" }}
         >
           {greeting}, {firstName}
         </h1>
       </div>
-
-      {/* Suggestion chips */}
       <div className="mt-10 flex flex-wrap items-center justify-center gap-2 sm:mt-12">
         {SUGGESTIONS.map(({ label, prompt, Icon }) => (
           <button
@@ -708,7 +921,7 @@ function HomeGreeting({
   );
 }
 
-// ── Chat input (large rounded box) ───────────────────────────────────
+// ── Chat input ────────────────────────────────────────────────────────
 
 function ChatInput({
   inputRef,
@@ -725,12 +938,27 @@ function ChatInput({
   disabled: boolean;
   interpreting: boolean;
 }) {
-  // Auto-grow textarea up to ~6 lines.
   function handleInput(e: React.ChangeEvent<HTMLTextAreaElement>) {
     onChange(e.target.value);
     const el = e.target;
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
+  }
+
+  // Voice input: append the final transcript to whatever's already in the
+  // textarea. Leading space preserves the user's existing text if they
+  // dictated mid-sentence. After receiving text we resize the textarea
+  // and refocus so Enter still works.
+  function handleVoiceTranscript(text: string) {
+    const next = value.trim() ? `${value.trimEnd()} ${text}` : text;
+    onChange(next);
+    requestAnimationFrame(() => {
+      const el = inputRef.current;
+      if (!el) return;
+      el.style.height = "auto";
+      el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
+      el.focus();
+    });
   }
 
   return (
@@ -766,6 +994,11 @@ function ChatInput({
             DotArc Agent
             <ChevronDown className="h-3.5 w-3.5" />
           </button>
+          <MicButton
+            onTranscript={handleVoiceTranscript}
+            disabled={disabled}
+            sizeClass="h-9 w-9"
+          />
           <button
             type="button"
             onClick={onSend}
@@ -773,11 +1006,7 @@ function ChatInput({
             aria-label="Send"
             className="ml-1 inline-flex h-9 w-9 items-center justify-center rounded-full bg-stone-900 text-white transition hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
           >
-            {interpreting ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <ArrowUp className="h-4 w-4" />
-            )}
+            {interpreting ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUp className="h-4 w-4" />}
           </button>
         </div>
       </div>
@@ -785,7 +1014,7 @@ function ChatInput({
   );
 }
 
-// ── Single chat message row ──────────────────────────────────────────
+// ── Single chat row ───────────────────────────────────────────────────
 
 function MessageRow({
   msg,
@@ -808,11 +1037,8 @@ function MessageRow({
     );
   }
   if (msg.role === "system") {
-    return (
-      <p className="text-center text-xs italic text-stone-400">{msg.text}</p>
-    );
+    return <p className="text-center text-xs italic text-stone-400">{msg.text}</p>;
   }
-  // agent
   return (
     <div className="flex justify-start">
       <div className="max-w-[90%] space-y-2">
@@ -826,8 +1052,13 @@ function MessageRow({
             {msg.text}
           </div>
         )}
-        {msg.skillResult && isPending && (
-          <ConfirmCard result={msg.skillResult} onConfirm={onConfirm} onDismiss={onDismiss} />
+        {!msg.pending && msg.text && (
+          <div className="flex items-center gap-1">
+            <SpeakButton text={msg.text} sizeClass="h-6 w-6" iconClass="h-3 w-3" />
+          </div>
+        )}
+        {msg.interpret && isPending && (
+          <ConfirmCard interpret={msg.interpret} onConfirm={onConfirm} onDismiss={onDismiss} />
         )}
       </div>
     </div>

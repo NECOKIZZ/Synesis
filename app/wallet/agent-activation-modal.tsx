@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { X, Bot, Tag, Lock, Gauge, Coins, ChevronRight, Check, Loader2 } from "lucide-react";
 import { useCircleWallet } from "@/app/circle-wallet-context";
+import { friendlyError, friendlyApiError } from "@/lib/friendly-errors";
 
 type Step = "name" | "pin" | "limits" | "fund" | "done";
 
@@ -45,32 +46,42 @@ export default function AgentActivationModal({ onClose, onActivated }: Props) {
     const body: Record<string, string> = {};
     if (!skipName && arcNameLabel.trim()) body.arcNameLabel = arcNameLabel.trim();
 
-    const res = await fetch("/api/agent/activate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const data = await res.json();
-    if (!res.ok) return err(data.error ?? "Activation failed");
-    setLoading(false);
-    setStep("pin");
+    try {
+      const res = await fetch("/api/agent/activate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        return err(await friendlyApiError(res, "Couldn't activate the agent. Please try again."));
+      }
+      setLoading(false);
+      setStep("pin");
+    } catch (e) {
+      return err(friendlyError(e, "Couldn't reach the server. Check your connection and try again."));
+    }
   }
 
   // ── Step 2: Set PIN ────────────────────────────────────────────────
   async function handlePin() {
     setError("");
-    if (!/^\d{4,8}$/.test(pin)) return err("PIN must be 4–8 digits");
-    if (pin !== pinConfirm) return err("PINs do not match");
+    if (!/^\d{4,8}$/.test(pin)) return err("PIN must be 4–8 digits.");
+    if (pin !== pinConfirm) return err("Those PINs don't match. Please re-enter.");
     setLoading(true);
-    const res = await fetch("/api/agent/set-pin", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pin }),
-    });
-    const data = await res.json();
-    if (!res.ok) return err(data.error ?? "Failed to set PIN");
-    setLoading(false);
-    setStep("limits");
+    try {
+      const res = await fetch("/api/agent/set-pin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pin }),
+      });
+      if (!res.ok) {
+        return err(await friendlyApiError(res, "We couldn't save your PIN. Please try again."));
+      }
+      setLoading(false);
+      setStep("limits");
+    } catch (e) {
+      return err(friendlyError(e, "Couldn't reach the server. Please try again."));
+    }
   }
 
   // ── Step 3: Set limits ─────────────────────────────────────────────
@@ -80,40 +91,54 @@ export default function AgentActivationModal({ onClose, onActivated }: Props) {
     const daily = parseFloat(maxDaily);
     const monthly = parseFloat(maxMonthly);
     if ([perTx, daily, monthly].some((v) => isNaN(v) || v <= 0)) {
-      return err("All limits must be positive numbers");
+      return err("All limits must be positive numbers.");
     }
     setLoading(true);
-    const res = await fetch("/api/agent/set-limits", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pin, maxPerTransaction: perTx, maxDaily: daily, maxMonthly: monthly }),
-    });
-    const data = await res.json();
-    if (!res.ok) return err(data.error ?? "Failed to save limits");
-    setLoading(false);
-    setStep("fund");
+    try {
+      const res = await fetch("/api/agent/set-limits", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pin, maxPerTransaction: perTx, maxDaily: daily, maxMonthly: monthly }),
+      });
+      if (!res.ok) {
+        return err(await friendlyApiError(res, "We couldn't save those limits. Please try again."));
+      }
+      setLoading(false);
+      setStep("fund");
+    } catch (e) {
+      return err(friendlyError(e, "Couldn't reach the server. Please try again."));
+    }
   }
 
   // ── Step 4: Fund agent ─────────────────────────────────────────────
   async function handleFund() {
     setError("");
     const amount = parseFloat(fundAmount);
-    if (isNaN(amount) || amount <= 0) return err("Enter a valid amount");
+    if (isNaN(amount) || amount <= 0) return err("Please enter a valid amount.");
     setLoading(true);
 
-    const res = await fetch("/api/agent/fund", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ amount: amount.toFixed(6) }),
-    });
-    const data = await res.json();
-    if (!res.ok) return err(data.error ?? "Failed to prepare funding");
+    let data: { challengeId: string; userToken: string; encryptionKey: string };
+    try {
+      const res = await fetch("/api/agent/fund", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ amount: amount.toFixed(6) }),
+      });
+      if (!res.ok) {
+        return err(
+          await friendlyApiError(res, "We couldn't prepare the funding transfer. Please try again."),
+        );
+      }
+      data = await res.json();
+    } catch (e) {
+      return err(friendlyError(e, "Couldn't reach the server. Please try again."));
+    }
 
     // Execute Circle PIN challenge (same as regular send)
     try {
       await executeChallenge(data.challengeId, data.userToken, data.encryptionKey);
     } catch (e) {
-      return err(e instanceof Error ? e.message : "Circle challenge failed");
+      return err(friendlyError(e, "PIN confirmation was cancelled. Please try again."));
     }
 
     setLoading(false);

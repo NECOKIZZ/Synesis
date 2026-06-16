@@ -30,6 +30,8 @@ export const SendUsdc: SkillHandler = {
   category: "TRANSFER",
   version: 1,
   affectsFunds: true,
+  // Draws USDC out of the agent wallet; amount is in USDC → gate on balance.
+  requiresBalanceCheck: true,
 
   // Same recipient + same amount = same intent. The future executor will
   // dedupe within a short window (e.g. 60 s) to neutralize double-click

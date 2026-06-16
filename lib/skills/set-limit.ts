@@ -34,6 +34,8 @@ export const SetLimit: SkillHandler = {
   category: "CONFIG",
   version: 1,
   affectsFunds: false,
+  // No PIN: this only updates the user's own spend-limit row.
+  requiresPin: false,
 
   async execute({ supabase, supabaseUserId, params }: SkillContext): Promise<SkillOutput> {
     const type   = String(params.type   ?? "");

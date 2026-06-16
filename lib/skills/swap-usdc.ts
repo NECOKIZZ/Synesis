@@ -17,7 +17,7 @@ import "server-only";
 import { formatUnits } from "ethers";
 import { AppKit } from "@circle-fin/app-kit";
 import { getCircleAdapter } from "@/lib/circleAdapter";
-import { readUsdcBalanceWei, circleDev } from "@/lib/circle";
+import { readUsdcBalanceWei, circleDev, circleRead } from "@/lib/circle";
 import type { SkillHandler, SkillContext, SkillOutput } from "./types";
 
 type SwapChain = Parameters<InstanceType<typeof AppKit>["swap"]>[0]["from"]["chain"];
@@ -31,6 +31,9 @@ export const SwapUsdc: SkillHandler = {
   category: "TRANSFER",
   version: 1,
   affectsFunds: true,
+  // No PIN: swap transforms tokens inside the agent wallet — nothing
+  // moves to a third party.
+  requiresPin: false,
 
   idempotencyKey(params): string | null {
     const tokenIn  = String(params.tokenIn  ?? "").toUpperCase().trim();
@@ -41,7 +44,7 @@ export const SwapUsdc: SkillHandler = {
   },
 
   async execute(ctx: SkillContext): Promise<SkillOutput> {
-    const { agentWallet, params } = ctx;
+    const { agentWallet, params, serviceSupabase, supabaseUserId } = ctx;
 
     const tokenIn  = String(params.tokenIn  ?? "").toUpperCase().trim();
     const tokenOut = String(params.tokenOut ?? "").toUpperCase().trim();
@@ -82,7 +85,9 @@ export const SwapUsdc: SkillHandler = {
         currentBalance = parseFloat(formatUnits(raw, tokenInInfo.decimals));
       } else {
         if (!circleDev) throw new Error("Circle client not configured");
-        const res = await circleDev.getWalletTokenBalance({ id: agentWallet.circle_wallet_id });
+        const res = await circleRead("getWalletTokenBalance(swap)", () =>
+          circleDev!.getWalletTokenBalance({ id: agentWallet.circle_wallet_id }),
+        );
         const balances = res.data?.tokenBalances ?? [];
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const entry = balances.find((b: any) => (b.token?.symbol ?? "").toUpperCase() === tokenIn) as { amount?: string } | undefined;
@@ -103,6 +108,40 @@ export const SwapUsdc: SkillHandler = {
     const kitKey = process.env.KIT_KEY;
     if (!kitKey) {
       return { ok: false, error: "KIT_KEY is not set — swap is not available. Add it from console.circle.com", status: 500 };
+    }
+
+    // Issue #25: Pre-insert a PENDING agent_spend_log row tagged with
+    // skill='SWAP_USDC' BEFORE touching Circle. Without this, the Circle
+    // webhook's claim-PENDING matcher finds nothing (because no row
+    // exists yet) and falls through to the generic insert path which
+    // hardcodes skill='AGENT_SEND'. By pre-inserting with the correct
+    // skill name we either (a) finalize the row ourselves on success
+    // below, or (b) let the webhook claim it by user_id + status=PENDING
+    // — either way the row keeps its SWAP_USDC label.
+    let logRowId: string | null = null;
+    try {
+      const { data: logRow, error: logErr } = await serviceSupabase
+        .from("agent_spend_log")
+        .insert({
+          user_id:     supabaseUserId,
+          wallet_type: "agent",
+          skill:       "SWAP_USDC",
+          // Swaps don't have a third-party recipient — store the agent's
+          // own wallet so the row has a valid counterparty for the
+          // activity feed, with metadata in description.
+          recipient_address: agentWallet.circle_wallet_address,
+          amount_usdc:       amount,
+          status:            "PENDING",
+        })
+        .select("id")
+        .single();
+      if (logErr) {
+        console.error("[swap-usdc] pending log insert failed:", logErr);
+      } else if (logRow?.id) {
+        logRowId = logRow.id as string;
+      }
+    } catch (logErr) {
+      console.error("[swap-usdc] pending log threw:", logErr);
     }
 
     try {
@@ -126,6 +165,16 @@ export const SwapUsdc: SkillHandler = {
 
       console.log("[swap-usdc] completed:", result.txHash, result.amountIn, "→", result.amountOut);
 
+      // Finalize the row ourselves so we don't depend on a Circle webhook
+      // arriving for the swap to show in the activity feed. The webhook,
+      // if it does arrive, will idempotently update status + tx_hash.
+      if (logRowId) {
+        await serviceSupabase
+          .from("agent_spend_log")
+          .update({ status: "COMPLETE", tx_hash: result.txHash ?? null })
+          .eq("id", logRowId);
+      }
+
       return {
         ok: true,
         result: {
@@ -141,6 +190,12 @@ export const SwapUsdc: SkillHandler = {
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Swap failed";
       console.error("[swap-usdc] error:", msg);
+      if (logRowId) {
+        await serviceSupabase
+          .from("agent_spend_log")
+          .update({ status: "FAILED", error_message: msg })
+          .eq("id", logRowId);
+      }
       if (msg.includes("Simulation failed") || msg.includes("Transaction reverted")) {
         return { ok: false, error: "Swap simulation failed: no liquidity for this pair on Arc Testnet, or price impact is too high. Try a smaller amount.", status: 502 };
       }

@@ -86,9 +86,9 @@ export type AgentPolicy = {
   created_at: string;
 
   // ── Orchestration model (new) ───────────────────────────────────────
-  trigger_type: string;           // 'time' | 'price' | 'balance_above'
+  trigger_type: string;           // 'time' | 'price' | 'balance_above' | 'and' (V3 composite)
   trigger_params: Record<string, unknown>;
-  action_skill: string;           // 'SEND_USDC' | 'SWAP_USDC' | 'WITHDRAW'
+  action_skill: string;           // 'SEND_USDC' | 'SWAP_USDC' | 'WITHDRAW' | 'COMPOUND' (V3 sentinel)
   action_params: Record<string, unknown>;
   execution_mode: string;         // 'once' | 'repeat'
   cooldown_seconds: number;
@@ -99,17 +99,21 @@ export type AgentPolicy = {
   policy_summary: string | null;
   policy_category: string | null;
   hmac_version: number;
-};
 
-// ── Context passed to onCronTick (lighter than SkillContext — no params) ──
+  /**
+   * V3: ordered list of PlanSteps for compound policies. Populated only
+   * when action_skill === "COMPOUND" — for simple single-action policies
+   * this is null and the cron uses action_skill + action_params instead.
+   * Each step matches the PlanStep shape from agent-types.ts.
+   */
+  steps: Array<{
+    skill: string;
+    params: Record<string, unknown>;
+    description: string;
+  }> | null;
 
-export type CronContext = {
-  supabase: SupabaseClient;
-  serviceSupabase: SupabaseClient;
-  supabaseUserId: string;
-  agentWallet: AgentWallet;
-  limits: SpendLimits;
-  getSpentSince: (since: Date) => Promise<number>;
+  // ── Misc ─────────────────────────────────────────────────────────────
+  pause_reason?: string | null;
 };
 
 // ── Skill metadata ─────────────────────────────────────────────────────────
@@ -119,18 +123,6 @@ export type SkillCategory =
   | "TRANSFER"  // moves real USDC out of the agent wallet
   | "CONFIG"    // mutates user settings (limits, prefs)
   | "POLICY";   // creates or modifies recurring policies
-
-// ── Cron tick result ───────────────────────────────────────────────────────
-//
-// The cron runner uses this to decide what to do next:
-//   { ok: true }                            → advance next_run, clear pause
-//   { ok: false, retry: true }              → retry on next tick (transient)
-//   { ok: false, pauseReason: "..." }       → mark policy inactive
-//   { ok: false }                           → log + skip; runner decides
-
-export type CronTickOutput =
-  | { ok: true; result?: Record<string, unknown> }
-  | { ok: false; error: string; retry?: boolean; pauseReason?: string };
 
 // ── The skill contract ─────────────────────────────────────────────────────
 
@@ -146,9 +138,32 @@ export interface SkillHandler {
   readonly affectsFunds: boolean;
 
   // ─── Behavior flags (optional) ──────────────────────────────────────────
-  // requiresPin   — default true. Set false ONLY for READ skills that have
-  //                 no side effects.
-  readonly requiresPin?: boolean;
+  // requiresPin   — default true. Set false for skills that don't move money
+  //                 outward to a third party (reads, config, swap-in-place,
+  //                 withdraw-to-own-main-wallet). Function form lets a skill
+  //                 decide at dispatch time based on params (e.g. BRIDGE_USDC
+  //                 only needs PIN when destination ≠ user's main wallet).
+  readonly requiresPin?:
+    | boolean
+    | ((
+        params: Record<string, unknown>,
+        ctx: { mainWalletAddress: string },
+      ) => boolean);
+
+  // requiresBalanceCheck — default false. Set true ONLY for skills that
+  //                 draw USDC out of the agent wallet UP FRONT, where the
+  //                 step's `params.amount` is denominated in USDC
+  //                 (SEND_USDC, WITHDRAW, BRIDGE_USDC, PAY_X402). The
+  //                 confirm-policy pre-flight sums these to fail a batch
+  //                 early — before the PIN — when the wallet is short.
+  //                 Config/read/policy skills (SET_LIMIT, GET_PRICE,
+  //                 LIST_POLICIES, IKNOW, CREATE_POLICY…) leave this false
+  //                 so their numeric params are NEVER mistaken for spend.
+  //                 SEND_TOKEN / non-USDC swaps also stay false because
+  //                 their amount is in a non-USDC unit; each such skill
+  //                 still runs its own in-skill balance check before
+  //                 moving anything.
+  readonly requiresBalanceCheck?: boolean;
 
   // ─── Idempotency (optional but strongly recommended for affectsFunds) ──
   // Returns a stable string identifying "the same intent again." When the
@@ -167,10 +182,4 @@ export interface SkillHandler {
 
   // ─── Execution ──────────────────────────────────────────────────────────
   execute(ctx: SkillContext): Promise<SkillOutput>;
-
-  // ─── Cron path (optional) ───────────────────────────────────────────────
-  // Required for any skill that creates rows in agent_policies that should
-  // execute on a schedule. Returns structured output so the cron runner can
-  // observe + react without poking DB rows.
-  onCronTick?(ctx: CronContext, policy: AgentPolicy): Promise<CronTickOutput>;
 }

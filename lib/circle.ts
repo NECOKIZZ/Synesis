@@ -38,6 +38,123 @@ export const circleDev: CircleDeveloperControlledWalletsClient | null =
 export const circleUser: CircleUserControlledWalletsClient | null =
   apiKey ? initiateUserControlledWalletsClient({ apiKey }) : null;
 
+// ── Resilience: timeout + retry + circuit breaker ─────────────────────
+//
+// Circle Testnet drops TCP sockets mid-request. Without an explicit
+// timeout a single hung SDK call waits 44+ s before ECONNRESET, and a
+// 3-task batch stacks those into 3+ minutes before a 500. These helpers
+// bound every Circle call and trip a breaker so repeated failures fail
+// fast instead of hanging.
+//
+// IMPORTANT: only READ calls (balance, tx status) are retried. WRITE
+// calls (createContractExecutionTransaction) are NEVER retried — a retry
+// after a timeout could double-submit a transaction that actually landed.
+
+const CIRCLE_CALL_TIMEOUT_MS = Number(process.env.CIRCLE_CALL_TIMEOUT_MS ?? 10_000);
+const CIRCLE_MAX_RETRIES = Number(process.env.CIRCLE_MAX_RETRIES ?? 3);
+const CB_THRESHOLD = Number(process.env.CIRCLE_CB_THRESHOLD ?? 3);
+const CB_COOLDOWN_MS = Number(process.env.CIRCLE_CB_COOLDOWN_MS ?? 30_000);
+
+export class CircleUnavailableError extends Error {
+  constructor(
+    message = "Circle is temporarily unavailable — please try again in a moment.",
+  ) {
+    super(message);
+    this.name = "CircleUnavailableError";
+  }
+}
+
+const RETRYABLE =
+  /socket hang up|ECONNRESET|ETIMEDOUT|timed out|fetch failed|network|EAI_AGAIN|ENOTFOUND|\b50[234]\b/i;
+
+// Module-level breaker state (per server instance).
+let cbConsecutiveFailures = 0;
+let cbOpenUntil = 0;
+
+function circuitOpen(): boolean {
+  return Date.now() < cbOpenUntil;
+}
+function recordCircleSuccess(): void {
+  cbConsecutiveFailures = 0;
+  cbOpenUntil = 0;
+}
+function recordCircleFailure(): void {
+  cbConsecutiveFailures += 1;
+  if (cbConsecutiveFailures >= CB_THRESHOLD) {
+    cbOpenUntil = Date.now() + CB_COOLDOWN_MS;
+    cbConsecutiveFailures = 0;
+    console.warn(`[circle] circuit breaker OPEN for ${CB_COOLDOWN_MS}ms`);
+  }
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`Circle call timed out after ${ms}ms (${label})`)),
+      ms,
+    );
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
+/**
+ * Wrap an idempotent Circle READ (balance, tx status). Bounded by timeout,
+ * retried with exponential backoff on transient network errors, and gated
+ * by the circuit breaker. Safe to retry because reads have no side effects.
+ */
+export async function circleRead<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  if (circuitOpen()) throw new CircleUnavailableError();
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= CIRCLE_MAX_RETRIES; attempt++) {
+    try {
+      const result = await withTimeout(fn(), CIRCLE_CALL_TIMEOUT_MS, label);
+      recordCircleSuccess();
+      return result;
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[circle] ${label} attempt ${attempt}/${CIRCLE_MAX_RETRIES} failed: ${msg}`);
+      if (!RETRYABLE.test(msg)) {
+        recordCircleFailure();
+        throw err;
+      }
+      if (attempt < CIRCLE_MAX_RETRIES) {
+        await new Promise((r) => setTimeout(r, 500 * 2 ** (attempt - 1)));
+      }
+    }
+  }
+  recordCircleFailure();
+  console.error(`[circle] ${label} exhausted retries:`, lastErr);
+  throw new CircleUnavailableError();
+}
+
+/**
+ * Wrap a Circle WRITE (contract execution / transfer). Bounded by timeout
+ * and gated by the breaker, but NEVER retried — retrying a money-moving
+ * call after a timeout risks a double-submit. A timeout here surfaces as
+ * an error; the caller marks the spend FAILED and the user retries.
+ */
+export async function circleWrite<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  if (circuitOpen()) throw new CircleUnavailableError();
+  try {
+    const result = await withTimeout(fn(), CIRCLE_CALL_TIMEOUT_MS, label);
+    recordCircleSuccess();
+    return result;
+  } catch (err) {
+    recordCircleFailure();
+    throw err;
+  }
+}
+
 // ── Encoders ─────────────────────────────────────────────────────────
 
 const registryInterface = new Interface([
@@ -350,12 +467,14 @@ async function executeAndWait(
   if (!circleDev) throw new Error("Circle dev client not configured");
   if (!treasuryWalletId) throw new Error("CIRCLE_TREASURY_WALLET_ID not set");
 
-  const txRes = await circleDev.createContractExecutionTransaction({
-    walletId: treasuryWalletId,
-    contractAddress,
-    callData,
-    fee: { type: "level", config: { feeLevel: "MEDIUM" } },
-  });
+  const txRes = await circleWrite("createContractExecutionTransaction(treasury)", () =>
+    circleDev.createContractExecutionTransaction({
+      walletId: treasuryWalletId,
+      contractAddress,
+      callData,
+      fee: { type: "level", config: { feeLevel: "MEDIUM" } },
+    }),
+  );
 
   const circleTxId = txRes.data?.id;
   if (!circleTxId) throw new Error("Circle returned no transaction id");
@@ -363,6 +482,7 @@ async function executeAndWait(
   const txHash = await waitForCircleTx(circleTxId);
   return { txHash, circleTxId };
 }
+
 
 /**
  * Treasury registers a name on behalf of a user.
@@ -428,9 +548,21 @@ export async function waitForCircleTx(
 ): Promise<string> {
   if (!circleDev) throw new Error("Circle dev client not configured");
 
+  let lastPollErr: unknown;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     await new Promise((r) => setTimeout(r, intervalMs));
-    const res = await circleDev.getTransaction({ id });
+    let res;
+    try {
+      // Bound each poll so a hung socket can't stall the whole wait. A
+      // transient failure just falls through to the next poll tick — the
+      // loop itself is the retry, so we don't run circleRead's breaker here.
+      res = await withTimeout(circleDev.getTransaction({ id }), CIRCLE_CALL_TIMEOUT_MS, "getTransaction");
+    } catch (err) {
+      lastPollErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[circle] getTransaction poll ${attempt + 1}/${maxAttempts} failed: ${msg}`);
+      continue;
+    }
     const tx = res.data?.transaction;
     const state = tx?.state;
 
@@ -445,7 +577,10 @@ export async function waitForCircleTx(
     }
   }
 
-  throw new Error(`Circle tx polling timed out (id: ${id})`);
+  throw new Error(
+    `Circle tx polling timed out (id: ${id})` +
+      (lastPollErr ? ` — last poll error: ${lastPollErr instanceof Error ? lastPollErr.message : String(lastPollErr)}` : ""),
+  );
 }
 
 // ── Treasury health ──────────────────────────────────────────────────

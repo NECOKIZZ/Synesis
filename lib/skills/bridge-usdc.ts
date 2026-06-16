@@ -31,6 +31,16 @@ export const BridgeUsdc: SkillHandler = {
   category: "TRANSFER",
   version: 1,
   affectsFunds: true,
+  // Burns USDC on the source chain; amount is in USDC → gate on balance.
+  requiresBalanceCheck: true,
+  // PIN required ONLY when bridging to a third party. If toAddress is
+  // empty (defaults to the user's main wallet) or matches mainWalletAddress,
+  // funds stay under the user's control and we skip the PIN dialog.
+  requiresPin(params, { mainWalletAddress }) {
+    const to = String(params.toAddress ?? "").trim().toLowerCase();
+    if (!to) return false;
+    return to !== mainWalletAddress.toLowerCase();
+  },
 
   idempotencyKey(params): string | null {
     const amount    = Number(params.amount);

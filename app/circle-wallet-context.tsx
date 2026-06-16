@@ -16,6 +16,8 @@ import {
   useRef,
   useState,
 } from "react";
+import { friendlyError } from "@/lib/friendly-errors";
+import { createSupabaseBrowserClient, isSupabaseConfigured } from "@/lib/supabase/client";
 
 const CIRCLE_APP_ID = process.env.NEXT_PUBLIC_CIRCLE_APP_ID || "";
 
@@ -131,14 +133,103 @@ export function CircleWalletProvider({ children }: { children: React.ReactNode }
     }
   }
 
-  function describeFetchError(err: unknown): string {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes("aborted") || msg.includes("AbortError"))
-      return "Request timed out. Please try again.";
-    if (msg.toLowerCase().includes("failed to fetch") || msg.toLowerCase().includes("networkerror"))
-      return "Couldn't reach the server. Check your connection.";
-    return msg;
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  /**
+   * fetchJsonWithRetry — resilient JSON fetch for the signup flow.
+   *
+   * Retries on **transient** failures only:
+   *   - network errors (fetch threw, AbortError, TypeError)
+   *   - 5xx responses
+   *
+   * Does NOT retry on:
+   *   - 4xx responses (the request is malformed or the user isn't allowed —
+   *     hammering the server won't help)
+   *
+   * Backoff doubles on each attempt, capped at 3s. With retries=3 and a
+   * starting delay of 400ms the worst-case extra latency before giving up
+   * is 400 + 800 + 1600 ≈ 2.8s, which is invisible to a happy-path user
+   * but rescues most flaky-Wi-Fi signups without bouncing them to the
+   * error screen.
+   */
+  async function fetchJsonWithRetry<T>(
+    url: string,
+    init: RequestInit,
+    options: { retries?: number; timeoutMs?: number; label: string },
+  ): Promise<T> {
+    const { retries = 3, timeoutMs = 30_000, label } = options;
+    let lastErr: unknown;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const res = await fetchWithTimeout(url, init, timeoutMs);
+        if (res.ok) {
+          return (await res.json()) as T;
+        }
+        const body: { error?: string } = await res.json().catch(() => ({}));
+        const message = body?.error || `${label} returned ${res.status}`;
+        if (res.status >= 400 && res.status < 500) {
+          // Permanent — surface immediately. Tag the error so the catch
+          // below knows to re-throw instead of treating it as transient.
+          const permanent = new Error(message) as Error & { _permanent?: true };
+          permanent._permanent = true;
+          throw permanent;
+        }
+        // 5xx — record and retry.
+        lastErr = new Error(message);
+      } catch (err) {
+        // 4xx errors thrown above carry the _permanent tag — bail
+        // immediately instead of retrying.
+        if (err && typeof err === "object" && (err as { _permanent?: boolean })._permanent) {
+          throw err;
+        }
+        // Anything else (TypeError, AbortError, our own 5xx Error,
+        // body parse failures) is transient — retry.
+        lastErr = err;
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[circle] ${label} attempt ${attempt + 1} failed:`, msg);
+      }
+      if (attempt < retries) {
+        await sleep(Math.min(400 * 2 ** attempt, 3000));
+      }
+    }
+    throw lastErr ?? new Error(`${label} failed after ${retries + 1} attempts`);
   }
+
+  // Single source of truth for turning any caught error into a user-facing
+  // string. Routes through the central pattern map in lib/friendly-errors.ts
+  // so we never leak stack traces, Circle internals, or "[object Object]".
+  function describeFetchError(err: unknown): string {
+    return friendlyError(err, "Couldn't reach the server. Please try again.");
+  }
+
+  // Shape returned by /api/circle/init-user. Pulled out so we can call
+  // init-user from two places: the initial entry, and the recovery path
+  // when wallet polling exhausts (init-user's FAST PATH lights up once
+  // Circle's backend has propagated the new wallet).
+  type InitUserResponse = {
+    userId: string;
+    userToken: string;
+    encryptionKey: string;
+    email: string;
+    challengeId?: string;
+    alreadyOnboarded: boolean;
+    walletAddress?: string;
+    session?: {
+      userId: string;
+      email: string;
+      walletAddress: string;
+      arcName: string | null;
+    };
+  };
+
+  type SessionResponse = {
+    session: {
+      userId: string;
+      email: string;
+      walletAddress: string;
+      arcName: string | null;
+    };
+  };
 
   const startCircleFlow = useCallback(async () => {
     setError(null);
@@ -149,35 +240,38 @@ export function CircleWalletProvider({ children }: { children: React.ReactNode }
     setStatus("signing-in");
     console.log("[circle] startCircleFlow");
 
-    // ── Step 1: init-user (single round-trip) ───────────────────────────
-    let userId: string, userToken: string, encryptionKey: string, email: string;
-    let challengeId: string | undefined;
-    let alreadyOnboarded = false;
-    let walletAddressFromInit: string | undefined;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let inlineSession: any | undefined;
+    // ── Apply an inline session (FAST PATH from init-user) ───────────────
+    const applyInlineSession = (s: NonNullable<InitUserResponse["session"]>) => {
+      const cleanSession: CircleSession = {
+        userId: s.userId,
+        email: s.email,
+        walletAddress: s.walletAddress,
+        arcName: s.arcName ?? null,
+      };
+      setSession(cleanSession);
+      setStatus(cleanSession.arcName ? "authenticated" : "needs-name");
+    };
+
+    // ── Step 1: init-user (with retry on transient errors) ──────────────
+    let initBody: InitUserResponse;
     try {
-      const initRes = await fetchWithTimeout(`/api/circle/init-user`, {
-        method: "POST",
-        // Content-Type is required even for empty-body POSTs: our CSRF
-        // middleware blocks any mutating request that isn't application/json.
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-      });
-      if (!initRes.ok) {
-        const data = await initRes.json().catch(() => ({}));
-        throw new Error(data.error || `init-user returned ${initRes.status}`);
-      }
-      const body = await initRes.json();
-      ({ userId, userToken, encryptionKey, challengeId, alreadyOnboarded, email } = body);
-      walletAddressFromInit = body.walletAddress;
-      inlineSession = body.session;
+      initBody = await fetchJsonWithRetry<InitUserResponse>(
+        `/api/circle/init-user`,
+        {
+          method: "POST",
+          // Content-Type is required even for empty-body POSTs: our CSRF
+          // middleware blocks any mutating request that isn't application/json.
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+        },
+        { label: "init-user", retries: 3 },
+      );
       console.log("[circle] init-user ok", {
-        userId,
-        email,
-        alreadyOnboarded,
-        hasChallenge: !!challengeId,
-        hasInlineSession: !!inlineSession,
+        userId: initBody.userId,
+        email: initBody.email,
+        alreadyOnboarded: initBody.alreadyOnboarded,
+        hasChallenge: !!initBody.challengeId,
+        hasInlineSession: !!initBody.session,
       });
     } catch (err) {
       console.error("[circle] init-user failed:", err);
@@ -189,27 +283,24 @@ export function CircleWalletProvider({ children }: { children: React.ReactNode }
     // ── Returning-user fast path ────────────────────────────────────────
     // The server has already finalized the session and set the cookie.
     // Skip /wallet polling AND /session — we're done in 1 round-trip.
-    if (inlineSession) {
-      const cleanSession: CircleSession = {
-        userId: inlineSession.userId,
-        email: inlineSession.email,
-        walletAddress: inlineSession.walletAddress,
-        arcName: inlineSession.arcName ?? null,
-      };
-      setSession(cleanSession);
-      setStatus(cleanSession.arcName ? "authenticated" : "needs-name");
+    if (initBody.session) {
+      applyInlineSession(initBody.session);
       return;
     }
 
     // ── New-user path: PIN dialog + wallet polling + session create ─────
-    if (!alreadyOnboarded && challengeId) {
+    if (!initBody.alreadyOnboarded && initBody.challengeId) {
       setStatus("challenging"); // now we KNOW a PIN dialog is about to show
       try {
         const sdk = await getSdk();
-        sdk.setAuthentication({ userToken, encryptionKey });
+        sdk.setAuthentication({
+          userToken: initBody.userToken,
+          encryptionKey: initBody.encryptionKey,
+        });
         await new Promise<void>((resolve, reject) => {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          sdk.execute(challengeId!, (error: any, result: any) => {
+          sdk.execute(initBody.challengeId!, (error: any, result: any) => {
+            console.log("[circle] execute callback fired:", { error, result });
             if (error) {
               reject(new Error(error.message || error.code || "Wallet creation cancelled"));
               return;
@@ -217,11 +308,15 @@ export function CircleWalletProvider({ children }: { children: React.ReactNode }
             if (result?.status === "COMPLETE") resolve();
             else if (result?.status === "FAILED" || result?.status === "ERROR")
               reject(new Error(`Challenge ${result.status}`));
+            else {
+              console.warn("[circle] unrecognized challenge status:", result?.status, result);
+              reject(new Error(`Unexpected status: ${result?.status || "unknown"}`));
+            }
           });
         });
       } catch (err) {
         console.error("[circle] sdk challenge failed:", err);
-        setError(err instanceof Error ? err.message : String(err));
+        setError(friendlyError(err, "Wallet setup was cancelled. Please try again."));
         setStatus("error");
         return;
       }
@@ -230,22 +325,25 @@ export function CircleWalletProvider({ children }: { children: React.ReactNode }
     setStatus("wallet-ready");
     // If init-user already gave us the wallet (shouldn't happen on new-user
     // path because no inlineSession, but defensively skip the loop), use it.
-    let wallet: { address: string } | null = walletAddressFromInit
-      ? { address: walletAddressFromInit }
+    let wallet: { address: string } | null = initBody.walletAddress
+      ? { address: initBody.walletAddress }
       : null;
 
     if (!wallet) {
-      // Exponential backoff for the eventual-consistency window after PIN
-      // setup. Most wallets appear in 1-3s, so try fast first then back off.
-      // Total worst-case wait: 500+1000+1500+2000+3000+4000 = 12s, same as old.
-      const intervalsMs = [500, 1000, 1500, 2000, 3000, 4000];
+      // Extended polling window — Circle's wallet provisioning is eventually
+      // consistent and on a slow network we sometimes saw the wallet appear
+      // 15-25s after PIN completion. The old 12s budget caused users to land
+      // on the "Try again" error screen even though their wallet was being
+      // created normally. Total worst-case wait now: ~24s.
+      const intervalsMs = [500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4000, 4000];
       for (let attempt = 0; attempt < intervalsMs.length; attempt++) {
         try {
           // userId is derived server-side from the verified Supabase session.
           // Do not pass it as a query param — it would be ignored anyway.
           const walletRes = await fetchWithTimeout(
             `/api/circle/wallet`,
-            { credentials: "include" }
+            { credentials: "include" },
+            10_000,
           );
           if (walletRes.ok) {
             wallet = await walletRes.json();
@@ -255,33 +353,71 @@ export function CircleWalletProvider({ children }: { children: React.ReactNode }
         } catch (err) {
           console.warn(`[circle] wallet lookup attempt ${attempt + 1} errored:`, err);
         }
-        await new Promise((r) => setTimeout(r, intervalsMs[attempt]));
+        await sleep(intervalsMs[attempt]);
+      }
+    }
+
+    // ── Recovery: polling exhausted ─────────────────────────────────────
+    // Instead of dumping the user on the "Try again" error screen, do
+    // exactly what the user would have done by clicking it: re-call
+    // init-user. By now Circle's wallet record has propagated and
+    // init-user lights up its FAST PATH (returns an inline session),
+    // letting us skip /wallet polling AND /session entirely.
+    //
+    // This is the single biggest UX fix — it converts the most common
+    // signup failure mode into a silent extra ~1s wait.
+    if (!wallet) {
+      console.warn("[circle] wallet polling exhausted — auto-recovering via init-user");
+      try {
+        const recovery = await fetchJsonWithRetry<InitUserResponse>(
+          `/api/circle/init-user`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+          },
+          { label: "init-user (recovery)", retries: 2 },
+        );
+        if (recovery.session) {
+          console.log("[circle] recovery FAST PATH succeeded");
+          applyInlineSession(recovery.session);
+          return;
+        }
+        if (recovery.walletAddress) {
+          wallet = { address: recovery.walletAddress };
+        }
+      } catch (err) {
+        // Fall through to the error screen with a sensible message —
+        // truly something else is wrong if init-user can't recover here.
+        console.error("[circle] recovery init-user failed:", err);
       }
     }
 
     if (!wallet) {
-      setError("Your wallet was created but our backend can't see it yet. Refresh in a few seconds.");
+      setError(
+        "Your wallet is still being created. Please give it a few seconds and try again.",
+      );
       setStatus("error");
       return;
     }
 
+    // ── Step 3: mint dotarc session JWT (with retry) ────────────────────
     try {
-      const sessRes = await fetchWithTimeout(`/api/circle/session`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ walletAddress: wallet.address }),
-      });
-      if (!sessRes.ok) {
-        const data = await sessRes.json().catch(() => ({}));
-        throw new Error(data.error || `session returned ${sessRes.status}`);
-      }
-      const { session: newSession } = await sessRes.json();
+      const sessBody = await fetchJsonWithRetry<SessionResponse>(
+        `/api/circle/session`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ walletAddress: wallet.address }),
+        },
+        { label: "session", retries: 3 },
+      );
       const cleanSession: CircleSession = {
-        userId: newSession.userId,
-        email: newSession.email,
-        walletAddress: newSession.walletAddress,
-        arcName: newSession.arcName ?? null,
+        userId: sessBody.session.userId,
+        email: sessBody.session.email,
+        walletAddress: sessBody.session.walletAddress,
+        arcName: sessBody.session.arcName ?? null,
       };
       setSession(cleanSession);
       // Returning users with a .arc name go straight to the dashboard.
@@ -292,6 +428,11 @@ export function CircleWalletProvider({ children }: { children: React.ReactNode }
       setError(describeFetchError(err));
       setStatus("error");
     }
+    // fetchJsonWithRetry/sleep/fetchWithTimeout are defined inside this
+    // component for closure-free reasons but are referentially stable across
+    // renders (no captured state). Adding them to deps would force a new
+    // startCircleFlow on every render with no behavioral benefit.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [getSdk]);
 
   const executeChallenge = useCallback(async (
@@ -340,6 +481,53 @@ export function CircleWalletProvider({ children }: { children: React.ReactNode }
     });
   }, [getSdk]);
 
+  /**
+   * Realtime: watch for `profiles.wallet_address` updates during onboarding.
+   * When the Circle webhook (challenges.initialize) updates the profile after
+   * the user completes the PIN dialog, this fires and re-runs startCircleFlow.
+   * init-user will then hit the FAST PATH (alreadyOnboarded=true) and the
+   * client auto-transitions — no refresh required.
+   */
+  useEffect(() => {
+    if (status !== "challenging" && status !== "wallet-ready") return;
+
+    const supabase = createSupabaseBrowserClient();
+    let channel: ReturnType<typeof supabase.channel> | null = null;
+    let cancelled = false;
+
+    async function setup() {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user || cancelled) return;
+
+      channel = supabase
+        .channel(`onboard-${user.id}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "UPDATE",
+            schema: "public",
+            table: "profiles",
+            filter: `id=eq.${user.id}`,
+          },
+          (payload) => {
+            const newWallet = (payload.new as Record<string, unknown>)?.wallet_address;
+            const oldWallet = (payload.old as Record<string, unknown>)?.wallet_address;
+            if (newWallet && !oldWallet) {
+              console.log("[circle] Realtime: wallet_address appeared, triggering flow recovery");
+              if (!cancelled) void startCircleFlow();
+            }
+          }
+        )
+        .subscribe();
+    }
+
+    setup();
+    return () => {
+      cancelled = true;
+      if (channel) void supabase.removeChannel(channel);
+    };
+  }, [status, startCircleFlow]);
+
   const registerName = useCallback(async (name: string) => {
     if (status !== "authenticated" && status !== "needs-name") {
       throw new Error("Not authenticated");
@@ -360,8 +548,7 @@ export function CircleWalletProvider({ children }: { children: React.ReactNode }
       setStatus("authenticated");
       return { arcName: data.arcName as string, txHash: data.txHash as string };
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setError(msg);
+      setError(friendlyError(err, "Name registration didn't go through. Please try again."));
       // Roll back to whichever screen the user came from.
       setStatus((prev) => (prev === "registering-name" ? "needs-name" : prev));
       throw err;
@@ -369,15 +556,59 @@ export function CircleWalletProvider({ children }: { children: React.ReactNode }
   }, [status]);
 
   const logout = useCallback(async () => {
+    // Surface server-side signout failures instead of silently swallowing
+    // them. The user still gets logged out locally either way, but if the
+    // server session couldn't be cleared we want them to know so they can
+    // refresh / retry instead of believing they're fully signed out.
+    let serverError: string | null = null;
+
+    // Issue #9: Clear the Supabase session as well as the Circle session.
+    // If we leave the Supabase session alive, AuthGate's getClaims() will
+    // find it on the next remount, auto-fire onVerified, and put the user
+    // straight back into the Circle flow — producing the "won't log out"
+    // loop. signOut() with scope:"local" only clears this browser's
+    // session (other devices stay signed in) and revokes the refresh
+    // token so the cookie can't silently resurrect.
+    if (isSupabaseConfigured()) {
+      try {
+        const supabase = createSupabaseBrowserClient();
+        const { error: supabaseErr } = await supabase.auth.signOut({ scope: "local" });
+        if (supabaseErr) {
+          console.warn("[circle] supabase signOut returned error:", supabaseErr);
+          serverError = friendlyError(
+            supabaseErr,
+            "Signed out locally, but we couldn't fully clear your sign-in session. Please refresh.",
+          );
+        }
+      } catch (err) {
+        console.warn("[circle] supabase signOut threw:", err);
+        // Don't block the rest of logout — fall through to the Circle
+        // server signout and local state clear below.
+      }
+    }
+
     try {
-      await fetch(`/api/circle/logout`, {
+      const res = await fetch(`/api/circle/logout`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
       });
-    } catch {}
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        serverError = friendlyError(
+          data?.error,
+          "You're signed out locally, but we couldn't fully end your server session. Please refresh.",
+        );
+      }
+    } catch (err) {
+      serverError = friendlyError(
+        err,
+        "You're signed out locally, but we couldn't reach the server to fully sign you out.",
+      );
+    }
     setSession(null);
     setStatus("anonymous");
+    if (serverError) setError(serverError);
   }, []);
 
   const value = useMemo<CircleWalletState>(() => ({
