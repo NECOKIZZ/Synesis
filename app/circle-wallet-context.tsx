@@ -83,6 +83,10 @@ export function CircleWalletProvider({ children }: { children: React.ReactNode }
   const clearError = useCallback(() => setError(null), []);
 
   const refresh = useCallback(async () => {
+    // Clear any stale error before re-deriving state. Without this, an error
+    // from a previous failed attempt survives a page revisit and gets handed
+    // to AuthGate as `initialError` on an otherwise-fresh login screen.
+    setError(null);
     try {
       const res = await fetch("/api/circle/me", { credentials: "include" });
       if (res.ok) {
@@ -315,10 +319,18 @@ export function CircleWalletProvider({ children }: { children: React.ReactNode }
           });
         });
       } catch (err) {
-        console.error("[circle] sdk challenge failed:", err);
-        setError(friendlyError(err, "Wallet setup was cancelled. Please try again."));
-        setStatus("error");
-        return;
+        // The Circle SDK callback is unreliable: its hardcoded 10s iframe
+        // timeout surfaces a spurious "Network error", and a user cancel or a
+        // stale-iframe hiccup also lands here — yet the wallet may well have
+        // been created (the webhook + Supabase Realtime below are the real
+        // completion signal). So we deliberately do NOT escalate to the
+        // full-screen "error" state. We log and fall through to the polling +
+        // recovery + Realtime safety net, which settles the truth and only
+        // surfaces an error if the wallet genuinely never appears.
+        console.warn(
+          "[circle] sdk challenge callback errored — deferring to webhook/polling:",
+          err,
+        );
       }
     }
 
@@ -445,9 +457,18 @@ export function CircleWalletProvider({ children }: { children: React.ReactNode }
     const sdk = await getSdk(true);
     sdk.setAuthentication({ userToken, encryptionKey });
     return await new Promise<{ txHash: string | null }>((resolve, reject) => {
+      // No artificial short timeout. The user may legitimately leave the PIN
+      // dialog open for a while, and auto-failing them mid-entry is exactly
+      // the interference we want to avoid. We keep only a generous 5-minute
+      // guard so a never-firing SDK callback (the stale-iframe bug) can't
+      // leave this promise pending forever. The message is phrased as
+      // "uncertain — check activity" so the caller (SendModal) routes it to
+      // the soft amber screen + webhook check, not a hard red failure.
       const timeout = setTimeout(() => {
-        reject(new Error("PIN confirmation timed out. Please try again."));
-      }, 60_000);
+        reject(new Error(
+          "Didn't get a response from the wallet dialog in time. Your transfer may still be processing — check your activity feed before retrying.",
+        ));
+      }, 5 * 60_000);
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       sdk.execute(challengeId, (err: any, result: any) => {

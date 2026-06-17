@@ -44,6 +44,38 @@ function formatUsdc(val: string) {
   return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 });
 }
 
+// Ask the webhook-populated wallet_transactions row whether a send actually
+// settled, independent of what Circle's flaky SDK callback reported. Returns
+// confirmed=true as soon as status===COMPLETE or a tx hash exists. Bounded
+// (default ~6s) so a webhook outage can never hang the modal — worst case we
+// fall back to the honest "uncertain, check activity" screen.
+async function confirmSendViaWebhook(
+  rowId: string,
+  opts: { attempts?: number; intervalMs?: number } = {},
+): Promise<{ confirmed: boolean; txHash: string | null }> {
+  const attempts = opts.attempts ?? 8;
+  const intervalMs = opts.intervalMs ?? 800;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetch(
+        `/api/wallet/tx-hash?id=${encodeURIComponent(rowId)}`,
+        { credentials: "include" },
+      );
+      if (res.ok) {
+        const data = (await res.json()) as { txHash: string | null; status?: string };
+        if (data.status === "COMPLETE" || data.txHash) {
+          return { confirmed: true, txHash: data.txHash ?? null };
+        }
+        if (data.status === "FAILED") return { confirmed: false, txHash: null };
+      }
+    } catch {
+      // transient — keep trying
+    }
+    if (i < attempts - 1) await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  return { confirmed: false, txHash: null };
+}
+
 // ── Component ────────────────────────────────────────────────────────
 
 interface SendModalProps {
@@ -156,17 +188,56 @@ export function SendModal({ onClose, onSent }: SendModalProps) {
       onSent();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      const isNetworkError = /timeout|reset|connect|network|fetch|econnreset/i.test(msg);
-      if (isNetworkError) {
-        // Transaction may have been broadcast before the connection dropped.
-        // Honest "uncertain" state so the user knows to check before retrying.
+
+      // A genuine, user-initiated cancel rejects WITHOUT broadcasting (the SDK
+      // only hits our error branch when the challenge never COMPLETEs), so
+      // there's nothing for the webhook to confirm. Check this FIRST and
+      // short-circuit — no 6s poll on a deliberate cancel. Keep it soft: drop
+      // back to the confirm screen with a gentle note, not a red "failed".
+      const isCancel =
+        /cancel|aborted|rejected by user|user.*denied/i.test(msg) &&
+        !/activity feed|went through|processing|response from the wallet/i.test(msg);
+      if (isCancel) {
+        setErrorMsg("You cancelled the PIN dialog — nothing was sent. Review and try again.");
+        setStep("confirm");
+        return;
+      }
+
+      // Not a clean cancel. Circle's W3S SDK callback is unreliable on Arc
+      // Testnet: a spurious "Network error" (its hardcoded 10s iframe timeout),
+      // a stale iframe, or our own long safety guard can reject even when the
+      // transfer actually broadcast. The webhook is the source of truth — so
+      // before showing failure we ask it whether the send settled. If it did,
+      // this was a false alarm: show success.
+      if (prepared.pendingRowId) {
+        const verdict = await confirmSendViaWebhook(prepared.pendingRowId);
+        if (verdict.confirmed) {
+          setTxHash(verdict.txHash);
+          setStep("done");
+          onSent();
+          return;
+        }
+      }
+
+      // Anything ambiguous (timeout, network, SDK "Network error", stale
+      // iframe, unexpected status, our 5-min guard) → honest "uncertain"
+      // state. The webhook hasn't confirmed within our short window, but the
+      // tx may still land, so we tell the user to check activity rather than
+      // implying a clean failure. (The "activity feed" wording flips the
+      // failed screen to its amber "Status uncertain" variant.)
+      const isUncertain =
+        /timeout|timed out|reset|connect|network|fetch|econnreset|w3s|iframe|unexpected status|activity feed|went through|processing|response from the wallet/i.test(
+          msg,
+        );
+      if (isUncertain) {
         setErrorMsg(
-          "Connection dropped while confirming. Your transfer may still have gone through — check your activity feed before retrying."
+          "We couldn't confirm the transfer before the dialog closed. It may still have gone through — check your activity feed before retrying."
         );
         setStep("failed");
         onSent(); // refresh balance/activity so the user can verify
         return;
       }
+
       setErrorMsg(friendlyError(err, "Transaction couldn't be completed."));
       setStep("failed");
     }
@@ -387,6 +458,11 @@ export function SendModal({ onClose, onSent }: SendModalProps) {
           {/* ════════════════════════════════════════ CONFIRM STEP */}
           {step === "confirm" && prepared && (
             <div className="space-y-4">
+              {errorMsg && (
+                <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-300">
+                  {errorMsg}
+                </div>
+              )}
               <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
                 <div className="space-y-3">
                   <Row
@@ -431,7 +507,7 @@ export function SendModal({ onClose, onSent }: SendModalProps) {
 
               <div className="flex gap-2">
                 <button
-                  onClick={() => { setPrepared(null); setStep("input"); }}
+                  onClick={() => { setErrorMsg(null); setPrepared(null); setStep("input"); }}
                   className="flex-1 rounded-xl border border-white/15 px-4 py-2.5 text-sm font-medium text-white/70 transition hover:bg-white/10 hover:text-white"
                 >
                   Back

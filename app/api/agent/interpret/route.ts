@@ -24,6 +24,7 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { createSupabaseServiceClient } from "@/lib/supabase/service";
 import { recallUserMemory, rememberNote } from "@/lib/memory";
 import { walrusEnabled, walrusRecall, walrusRemember } from "@/lib/memory/walrus-adapter";
+import { checkRateLimit } from "@/lib/rate-limit";
 import crypto from "node:crypto";
 
 export const runtime = "nodejs";
@@ -64,6 +65,17 @@ export async function POST(req: Request) {
   }
 
   const { supabaseUserId } = agentSession;
+
+  // ── Rate limit ────────────────────────────────────────────────────
+  // Each interpret hits OpenRouter (costs money), so cap per-user volume.
+  // Fail-open: a limiter outage never blocks a legit user (see lib/rate-limit).
+  const rl = await checkRateLimit(supabaseUserId, "interpret", { max: 10, windowSeconds: 60 });
+  if (!rl.allowed) {
+    return NextResponse.json(
+      { error: `You're sending requests too quickly. Try again in ${rl.retryAfterSeconds}s.` },
+      { status: 429, headers: { "Retry-After": String(rl.retryAfterSeconds) } },
+    );
+  }
 
   // ── Body ──────────────────────────────────────────────────────────
   let instruction: string;

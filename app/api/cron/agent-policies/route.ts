@@ -45,6 +45,10 @@ export const runtime = "nodejs";
 const CRON_SECRET = process.env.CRON_SECRET;
 const MAX_POLICIES_PER_TICK = Number(process.env.CRON_MAX_POLICIES_PER_TICK ?? 50);
 const CRON_CONCURRENCY = Number(process.env.CRON_CONCURRENCY ?? 4);
+// How long a run claim is considered "live" before another invocation may
+// take it over. Must exceed the worst-case single-policy execution time
+// (slow Circle calls) so we never re-claim a still-running policy.
+const CRON_CLAIM_STALE_SECONDS = Number(process.env.CRON_CLAIM_STALE_SECONDS ?? 300);
 
 // Used by the price-trigger evaluator. Validation in lib/agent-core-v3
 // already enforces this on insert; we re-validate here defensively in
@@ -243,6 +247,37 @@ async function runPolicy(
     }
   }
 
+  // ── Claim this run slot (concurrency lock + idempotency) ─────────
+  // The single most important guard against double-PAYMENT: two concurrent
+  // cron invocations (or a Vercel retry) racing the same due policy. The
+  // claim is atomic in Postgres — only the winner proceeds; a fresh slot held
+  // by a live invocation is refused, a stale one (crashed holder) is retaken.
+  // Time triggers key on next_run (deterministic per cycle); price/balance
+  // triggers (null next_run) key on the current minute bucket.
+  const scheduledFor =
+    policy.next_run ??
+    new Date(Math.floor(now.getTime() / 60_000) * 60_000).toISOString();
+  const freeClaim = async () => {
+    await serviceSupabase
+      .from("cron_runs")
+      .delete()
+      .eq("policy_id", policy.id)
+      .eq("scheduled_for", scheduledFor);
+  };
+  const { data: claimed, error: claimErr } = await serviceSupabase.rpc("claim_cron_run", {
+    p_policy_id: policy.id,
+    p_scheduled_for: scheduledFor,
+    p_stale_seconds: CRON_CLAIM_STALE_SECONDS,
+  });
+  if (claimErr) {
+    // Never risk a double-execute on uncertainty — skip and retry next tick.
+    console.warn(`[cron] claim error for ${policy.id} (skipping):`, claimErr.message);
+    return { policyId: policy.id, action: actionLabel, ok: false, error: "Run claim failed", retry: true };
+  }
+  if (claimed !== true) {
+    return { policyId: policy.id, action: actionLabel, ok: true, error: "Already claimed this cycle (idempotent skip)" };
+  }
+
   // ── Compound execution (multi-step) ─────────────────────────────
   if (isCompound && stepsForExec && stepsForExec.length > 0) {
     const planResult = await executePlanForCron(stepsForExec, {
@@ -323,6 +358,9 @@ async function runPolicy(
     await deactivate(serviceSupabase, policy.id, output.error ?? "Execution failed");
     return { policyId: policy.id, action: policy.action_skill, ok: false, pauseReason: output.error };
   }
+  // Transient failure: release the claim so the next tick can retry this slot
+  // immediately instead of waiting out the stale window.
+  await freeClaim();
   return { policyId: policy.id, action: policy.action_skill, ok: false, error: output.error, retry: true };
 }
 

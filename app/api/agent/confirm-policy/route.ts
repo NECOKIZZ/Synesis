@@ -38,6 +38,7 @@ import { batchRequiresPin } from "@/lib/skills/pin-policy";
 import type { SkillContext } from "@/lib/skills";
 import { resolveRecipient } from "@/lib/ans";
 import { recordSendHabit } from "@/lib/memory";
+import { checkRateLimit } from "@/lib/rate-limit";
 import type { Task, PlanStep } from "@/lib/agent-types";
 import crypto from "node:crypto";
 
@@ -547,6 +548,17 @@ export async function POST(req: Request) {
     return res as Response;
   }
   const { session, supabaseUserId } = agentSession;
+
+  // L1.5: rate limit money-moving confirmations (abuse / runaway-retry guard).
+  // Stricter than interpret. Fail-open — the real money-safety controls are
+  // PIN + idempotency + withUserLock below.
+  const rl = await checkRateLimit(supabaseUserId, "confirm-policy", { max: 5, windowSeconds: 60 });
+  if (!rl.allowed) {
+    return NextResponse.json(
+      { error: `Too many confirmations in a short time. Try again in ${rl.retryAfterSeconds}s.` },
+      { status: 429, headers: { "Retry-After": String(rl.retryAfterSeconds) } },
+    );
+  }
 
   // Body
   let body: { pin?: unknown; tasks?: unknown };

@@ -32,6 +32,14 @@ export function AuthGate({
   const [error, setError] = useState<string | null>(initialError ?? null);
   const [info, setInfo] = useState<string | null>(null);
 
+  // Re-sync when the parent's context error changes. `error` is seeded once
+  // from `initialError` via useState, so without this a stale error from a
+  // prior failed Circle attempt would persist on a fresh login screen even
+  // after the parent cleared it (on onVerified → clearError, or refresh()).
+  useEffect(() => {
+    setError(initialError ?? null);
+  }, [initialError]);
+
   // On mount: if Supabase already has a verified session, skip the gate entirely.
   // Guarded by a ref so we fire onVerified AT MOST ONCE per page-lifetime —
   // prevents an infinite remount loop when startCircleFlow fails and parent

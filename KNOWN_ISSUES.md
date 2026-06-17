@@ -87,25 +87,43 @@ When asked `what's the price of Bitcoin?`, Claude classifies the request as "con
 
 ## 2. Security & Auth
 
-### 2.1 Duplicate Agent Routes Still Exist 🟠
+### 2.1 Duplicate Agent Routes Still Exist 🟠 — partially resolved (2026-06-16)
 
-Standalone routes bypass the registry and create security drift:
-- `app/api/agent/withdraw/route.ts`
-- `app/api/agent/set-limits/route.ts`
-- `app/api/agent/cancel-policy/route.ts`
+Standalone routes bypass the registry and create security drift (e.g. the 2026-06-16
+rate limiter protects `confirm-policy` but NOT these side doors). The skills
+themselves (`WITHDRAW`, `SET_LIMIT`, `CANCEL_POLICY` in `lib/skills/`, registered in
+`lib/skills/index.ts`) are the canonical path and are **untouched** — only the
+duplicate HTTP routes are in question.
 
-These were hardened (shared PIN, service-role updates) but still don't go through `confirm-policy` + `skillRegistry`.
+Verification (2026-06-16):
+- `app/api/agent/withdraw/route.ts` — ✅ **dead code, no callers → DELETED.** The
+  `WITHDRAW` skill via `confirm-policy` is the live path.
+- `app/api/agent/set-limits/route.ts` — ⚠️ **still used** by `agent-activation-modal.tsx:98`
+  and `wallet-shell.tsx:1035`. Retiring it requires repointing those buttons to
+  `confirm-policy` (`SET_LIMIT`) + live testing. **Deferred.**
+- `app/api/agent/cancel-policy/route.ts` — ⚠️ **still used** by `agent/page.tsx:622`,
+  `wallet-shell.tsx:1370` & `:2036`. Same migration + test needed. **Deferred.**
 
-- **Fix:** Delete standalone routes; migrate frontend to call `/api/agent/confirm-policy` with `skill = "WITHDRAW" / "SET_LIMIT" / "CANCEL_POLICY"`
+- **Remaining fix:** migrate the 4 frontend call sites to `confirm-policy`, then
+  delete the two standalone routes. Skills stay; only the routes go.
 
-### 2.2 HMAC Does Not Bind Full Policy Params 🟠
+### 2.2 HMAC Does Not Bind Full Policy Params 🟢 — mostly stale (re-verified 2026-06-16)
 
-Current HMAC covers: `userId || policyId || actionSkill || actionParams || triggerType || triggerParams || executionMode || createdAt`
+Re-checked against `signOrchestrationHmac` (`lib/agent.ts:218`). The V2 canonical
+already signs `actionParams`, `triggerParams`, `stopConditions`, `cooldownSeconds`,
+`steps`, etc. So the original claims are largely false:
+- `day_of_week` / `day_of_month` — **already covered**: they live inside
+  `trigger_params`, which is signed.
+- arbitrary `params` JSON — **already covered**: `action_params` is signed.
+- `next_run` — **must NOT be signed**: the cron legitimately mutates it every run;
+  signing it would invalidate every policy after its first fire. The original "fix"
+  was wrong here.
 
-It does NOT cover: `day_of_week`, `day_of_month`, arbitrary `params` JSON, `next_run`.
-
-- **Risk:** DB tamper can alter schedule fields without invalidating HMAC
-- **Fix:** Canonicalize `params` JSON (sorted keys) and include in HMAC payload; re-verify in cron
+Only genuine residual (low severity, robustness not security): `JSON.stringify`
+assumes stable key order, but Postgres JSONB may reorder nested keys between
+sign-time and verify-time → could cause *false* HMAC rejections. A recursive
+sorted-key canonicalization would harden this, but must be done carefully (a naive
+change invalidates all existing signed policies). **Not urgent; no action taken.**
 
 ### 2.3 No Rate Limiting on Agent Routes 🟠
 
@@ -113,11 +131,10 @@ It does NOT cover: `day_of_week`, `day_of_month`, arbitrary `params` JSON, `next
 
 - **Fix:** Per-user token bucket — e.g. 10 interprets/min, 5 confirms/min. Use `rate_limits` table or Upstash.
 
-### 2.4 `requireAgentSession` Missing Cross-Email Check 🟡
+### 2.4 `requireAgentSession` Missing Cross-Email Check ✅ Already done (verified 2026-06-16)
 
-`/api/circle/send-prepare` cross-checks JWT email vs Supabase email. The agent path (`requireAgentSession`) does not.
-
-- **Fix:** Add the same cross-check to `requireAgentSession` for defense in depth
+Re-checked `lib/agent.ts:103-108`: `requireAgentSession` **does** cross-check
+`claimEmail !== session.email → 401 "Session mismatch"`. The doc was stale. No action.
 
 ### 2.5 WITHDRAW Spend-Limit Semantics 🟡
 
@@ -132,12 +149,20 @@ Treasury granted one-time unlimited approval (`2^256 - 1`) to ANS registry contr
 
 - **Fix:** Switch to just-in-time exact approvals (5 USDC per registration) inside `treasuryRegisterName()`
 
-### 2.7 `/api/register-name` Missing Rate Limit + Ownership Check 🟠
+### 2.7 `/api/register-name` Hardening 🟡 — re-scoped (verified 2026-06-16)
 
-Route calls treasury to spend USDC. Needs:
-- Rate limiting per user
-- Check that `userWalletAddress` in request matches authenticated user's wallet
-- Structured logging for audit trail
+Actual route is `app/api/circle/register-name/route.ts`. Re-checked:
+- Ownership check — ✅ **already safe**: uses `session.walletAddress`, never a
+  client-supplied address (no spoofable field).
+- Structured logging — ✅ **already present** (server-side error logs, lines 96/103).
+- Rate limiting — missing, but Guard 1 (`reverseLookup`) caps each wallet to one
+  name, so plain rate limiting adds little.
+- **Real residual (TOCTOU double-payment race) — ✅ Fixed (2026-06-16):** the
+  guard+register critical section is now wrapped in `withUserLock(session.walletAddress)`
+  so concurrent registrations for the same wallet serialize and can't double-charge
+  the treasury. Same-instance protection (matches confirm-policy's accepted caveat);
+  cross-instance hardening (Postgres advisory lock) remains a mainnet item. Touches
+  the treasury payment path → **verify on testnet** (concurrent double-submit).
 
 ### 2.8 No Bot Protection on Signup 🟠
 
@@ -172,17 +197,21 @@ Route calls treasury to spend USDC. Needs:
 
 ## 3. Cron & Policy Execution
 
-### 3.1 Cron Row-Level Claim/Lock Missing 🟠
+### 3.1 Cron Row-Level Claim/Lock Missing ✅ Fixed (2026-06-16) — needs live retest
 
-No `claimed_at` column on `agent_policies`. Two concurrent cron invocations could double-execute the same policy.
+**Resolution (branch `v3-hardening`, migration `0012_cron_runs.sql`):** Each policy
+fire now claims a slot via the atomic `claim_cron_run()` RPC before executing. Two
+concurrent cron invocations race the claim; only the winner runs. A stale claim
+(crashed holder, older than `CRON_CLAIM_STALE_SECONDS`=300) is retaken.
 
-- **Fix:** Add `claimed_at` timestamp + `UPDATE ... WHERE id = ? AND claimed_at IS NULL RETURNING *` pattern
+### 3.2 Cron Idempotency (Circle API) ✅ Fixed (2026-06-16) — needs live retest
 
-### 3.2 Cron Idempotency (Circle API) 🟠
-
-No `cron_runs` table. Vercel cron retries on timeout → double payment risk.
-
-- **Fix:** Insert into `cron_runs` (policy_id + scheduled_run_timestamp) BEFORE calling Circle. Pass same idempotency key to Circle's API.
+**Resolution:** Same `cron_runs` mechanism. The slot key is `(policy_id,
+scheduled_for)` — `next_run` for time triggers, minute-bucket for price/balance —
+so a Vercel retry within the cycle hits the unique claim and is an idempotent skip
+instead of a second payment. Transient failures `freeClaim()` so the next tick can
+retry; permanent failures deactivate the policy. Wired in
+`app/api/cron/agent-policies/route.ts` (`runPolicy`).
 
 ### 3.3 No Cron Per-Run Quota 🟡
 
@@ -359,7 +388,26 @@ UI promises "6-digit code"; template sends `{{ .ConfirmationURL }}` instead of `
 
 - **Fix:** Supabase dashboard tweak — no code change. Deferred until pre-launch polish.
 
-### 5.8 Circle Modal Error Handling Needs Refinement 🟠
+### 5.8 Circle Modal Error Handling Needs Refinement ✅ Fixed (2026-06-16) — needs live retest
+
+**Resolution (branch `v3-hardening`):** The Circle SDK modal now owns its own
+interaction (PIN entry, internal retries, cancel); the **webhook + Realtime** own
+completion truth. Changes:
+- `startCircleFlow` no longer escalates an SDK challenge callback failure to the
+  full-screen `"error"` state — it logs and falls through to the existing
+  polling + recovery + Realtime safety net.
+- `executeChallenge` 60s hard timeout removed (was auto-failing users who left the
+  PIN dialog open) → generous 5-min guard phrased as "uncertain — check activity".
+- `SendModal.handleConfirm` confirms via the webhook (`confirmSendViaWebhook` →
+  `/api/wallet/tx-hash` status) before declaring failure; deliberate cancel returns
+  softly to the confirm screen; ambiguous errors show the amber "uncertain" screen.
+- `refresh()` now resets `error`; `AuthGate` re-syncs `initialError` via `useEffect`
+  so stale errors never bleed onto a fresh login screen.
+
+Verified: `tsc --noEmit` clean. Live retest (onboarding cancel, slow PIN on send,
+ambiguous failure) still pending on the dev server.
+
+<details><summary>Original report</summary>
 
 The login flow (`circle-wallet-context.tsx` → `wallet/page.tsx` → `auth-gate.tsx`) has overlapping and persistent error handling around the Circle PIN modal:
 
@@ -369,6 +417,8 @@ The login flow (`circle-wallet-context.tsx` → `wallet/page.tsx` → `auth-gate
 4. **Modal state vs. app state are not separated.** A transient PIN entry failure should live only inside the modal's own retry loop. It should never propagate into the app's global `error` state or survive a page transition.
 
 - **Fix:** Distinguish "modal cancelled / wrong PIN" (transient, modal-internal) from "infrastructure failure" (persistent, app-level). Only propagate the latter into `error`. Reset `error` aggressively on `startCircleFlow()` entry and in `refresh()`.
+
+</details>
 
 ---
 
