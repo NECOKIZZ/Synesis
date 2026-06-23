@@ -306,9 +306,17 @@ export async function initCircleUser(email: string): Promise<InitUserResult> {
     );
     if (arcWallet?.address) existingWalletAddress = arcWallet.address;
   } catch (err) {
-    // Non-fatal — but we MUST surface it, because if listWallets is failing
-    // silently the fast-path will never engage for returning users.
-    console.warn("[initCircleUser] listWallets failed:", err instanceof Error ? err.message : err);
+    // HARD FAIL on listWallets errors. The old behavior swallowed this and
+    // fell through to createUserPinWithWallets, which would mint a SECOND
+    // wallet for a returning user — making their original wallet (and any
+    // funds in it) invisible to our app. Better to surface a transient
+    // error to the client (which retries via fetchJsonWithRetry) than to
+    // silently fork a user's identity.
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[initCircleUser] listWallets failed — refusing to fall through:", msg);
+    throw new Error(
+      "Couldn't verify your existing wallet with Circle. Please try again in a moment.",
+    );
   }
 
   if (existingWalletAddress) {
