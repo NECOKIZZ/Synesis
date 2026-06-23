@@ -215,11 +215,40 @@ export type OrchestrationHmacFields = {
   steps?: Array<Record<string, unknown>> | null;
 };
 
+/**
+ * Deterministic JSON serialization with recursively sorted object keys.
+ *
+ * CRITICAL: the plain `JSON.stringify` we used before preserved JS object
+ * insertion order. But `action_params` / `trigger_params` / `stop_conditions`
+ * / `steps` are stored as Postgres `jsonb`, which re-sorts keys by (length,
+ * bytewise) on write. So the cron read keys back in a DIFFERENT order than
+ * they were signed in (e.g. `{recipient, amount}` → `{amount, recipient}`),
+ * producing a different hash and failing verification on EVERY policy.
+ *
+ * Sorting keys here makes the canonical bytes independent of storage
+ * reordering, so sign-time and verify-time always agree. Arrays keep their
+ * order (semantically significant — e.g. compound `steps`); only object keys
+ * are sorted.
+ */
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(",")}]`;
+  }
+  const keys = Object.keys(value as Record<string, unknown>).sort();
+  const body = keys
+    .map((k) => `${JSON.stringify(k)}:${stableStringify((value as Record<string, unknown>)[k])}`)
+    .join(",");
+  return `{${body}}`;
+}
+
 function signOrchestrationHmac(fields: OrchestrationHmacFields): string {
-  // Canonical payload — keys must always appear in the same order so the
-  // hash is deterministic. We only include `steps` when it's a non-empty
-  // array, which keeps backwards compatibility with V2 rows that never
-  // had this key in their canonical input.
+  // Canonical payload. Key order no longer matters — `stableStringify`
+  // sorts keys recursively so the hash is stable across the jsonb round-trip.
+  // We only include `steps` when it's a non-empty array, which keeps
+  // backwards compatibility with V2 rows that never had this key.
   const canonical: Record<string, unknown> = {
     userId: fields.userId,
     policyId: fields.policyId,
@@ -238,7 +267,7 @@ function signOrchestrationHmac(fields: OrchestrationHmacFields): string {
 
   return crypto
     .createHmac("sha256", getHmacSecret())
-    .update(JSON.stringify(canonical))
+    .update(stableStringify(canonical))
     .digest("hex");
 }
 

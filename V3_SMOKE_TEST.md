@@ -93,6 +93,28 @@ but log them.
 
 ---
 
+### 🔴 Critical Finding (2026-06-23) — every policy was being killed by an HMAC bug
+
+**Symptom:** Every `agent_policies` row, going back to May, was `active: false` with
+`pause_reason: "HMAC verification failed"`. The cron looked "disconnected" but was
+running fine — it just deactivated every policy on sight, so nothing ever fired.
+
+**Root cause:** `signOrchestrationHmac` in `lib/agent.ts` hashed the policy with a plain
+`JSON.stringify`, which preserves JS object key order. But `action_params` /
+`trigger_params` / `steps` are Postgres `jsonb`, which **re-sorts keys by length** on
+write. So the cron read keys back in a different order than they were signed in
+(e.g. `{recipient, amount}` → `{amount, recipient}`), produced a different hash, and
+failed verification on **every** policy.
+
+**Fix:** `signOrchestrationHmac` now uses a `stableStringify` (recursively sorted keys),
+making the hash independent of the jsonb round-trip. Proven order-independent; the test
+policy then fired successfully end-to-end (real 0.1 USDC send, tx `0xb990…`).
+
+**⚠️ MUST DEPLOY:** Production still runs the OLD code. cron-job.org pings prod every
+minute, and prod's old order-sensitive verify **re-deactivates any policy within ~1 min**
+(this is what kept poisoning the local tests, and what "made the cron disappear"). The
+fix is worthless until `lib/agent.ts` is deployed to production. **This is the #1 next action.**
+
 ### Result log
 
 | Test | Result | Notes |
@@ -104,8 +126,8 @@ but log them.
 | A5 |  |  |
 | B1 |  |  |
 | B2 |  |  |
-| C1 |  |  |
-| C2 |  |  |
+| C1 | ✅ (see note) | One clean fire → exactly **one** COMPLETE spend (tx `0xb990…`) + **one** `cron_runs` row for the minute slot. Full 3-min loop not run because prod's old code deactivates the policy within ~1 min (see Critical Finding). |
+| C2 | ✅ PASS | Two concurrent `claim_cron_run` calls on the same slot → one `true`, one `false`, exactly **one** `cron_runs` row. No double-pay. |
 | D1 |  |  |
 | E1 |  |  |
 | E2 |  |  |
