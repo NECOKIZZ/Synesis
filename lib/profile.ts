@@ -1,5 +1,5 @@
 /**
- * Profile helpers — DotArc's own user record, persisted in Supabase Postgres.
+ * Profile helpers — Synesis's own user record, persisted in Supabase Postgres.
  *
  * One row per user, linked to auth.users.id. Stores:
  *   - email (verified)

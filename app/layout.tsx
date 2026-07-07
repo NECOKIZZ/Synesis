@@ -4,7 +4,7 @@ import { GeistSans } from "geist/font/sans";
 import { CircleWalletProvider } from "./circle-wallet-context";
 
 export const metadata: Metadata = {
-  title: "DotArc Smart Wallet",
+  title: "Synesis Smart Wallet",
   description: "Your wallet. Your name. Nothing else. A USDC-native smart wallet where your identity is your .arc name.",
   icons: {
     icon: "/dotarc.png",

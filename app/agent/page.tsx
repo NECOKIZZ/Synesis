@@ -7,6 +7,7 @@ import { useCircleWallet } from "../circle-wallet-context";
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 import { friendlyError, friendlyApiError } from "@/lib/friendly-errors";
 import { buildConversationHistory } from "@/lib/agent-history";
+import { formatRetrieveTransactions } from "@/lib/format-transactions";
 import { useSessionEndSummary } from "@/lib/memory/use-session-end-summary";
 import { MicButton } from "@/components/voice/MicButton";
 import { SpeakButton } from "@/components/voice/SpeakButton";
@@ -65,6 +66,13 @@ type InterpretResult = {
   tasks: Task[];
   combined_confirmation_message: string;
   unknown_reason?: string;
+  // Whether the batch needs a PIN — decided server-side by batchRequiresPin.
+  // false for reads / config / swap / self-withdraw / self-bridge.
+  requires_pin?: boolean;
+  // Server-computed upfront USDC across "now" tasks (requiresBalanceCheck skills).
+  upfront_usdc?: number;
+  // Server-computed — batch needs no PIN and can auto-execute without a card (F-8).
+  auto_confirm?: boolean;
 };
 
 type StepResult = {
@@ -214,33 +222,39 @@ function ConfirmCard({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  // Read-only single-task batches skip the PIN prompt and auto-confirm.
-  const isReadOnly =
-    interpret.tasks.length === 1 &&
-    interpret.tasks[0].steps.length === 1 &&
-    ["CHECK_BALANCE", "LIST_POLICIES", "IKNOW", "GET_PRICE"].includes(interpret.tasks[0].steps[0].skill);
+  // Batches that need no PIN (reads, config, and same-user money moves —
+  // withdraw-to-self, swap-in-place, self-bridge) skip the confirm card and
+  // auto-execute. The decision is server-computed (auto_confirm) from the
+  // shared pin-policy SSOT, so this surface no longer keeps its own read-only
+  // allowlist (F-8 — a plain withdraw used to wrongly show a card).
+  const autoConfirm = interpret.auto_confirm === true;
+
+  // Whether this batch actually needs a PIN is decided server-side (batchRequiresPin):
+  // only outward third-party sends do. Swap / withdraw / self-bridge / set-limit
+  // need no PIN — and now skip the card entirely via autoConfirm above.
+  const needsPin = interpret.requires_pin !== false;
 
   useEffect(() => {
-    if (isReadOnly) void onConfirm("");
+    if (autoConfirm) void onConfirm("");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function submit() {
-    if (!/^\d{4,8}$/.test(pin)) {
+    if (needsPin && !/^\d{4,8}$/.test(pin)) {
       setError("Enter your 4–8 digit agent PIN");
       return;
     }
     setLoading(true);
     setError("");
     try {
-      await onConfirm(pin);
+      await onConfirm(needsPin ? pin : "");
     } catch (e) {
       setError(friendlyError(e, "Confirmation failed. Please try again."));
       setLoading(false);
     }
   }
 
-  if (isReadOnly) return null;
+  if (autoConfirm) return null;
 
   return (
     <div className="max-w-lg space-y-3 rounded-2xl border border-stone-200 bg-white p-4 shadow-sm">
@@ -270,21 +284,23 @@ function ConfirmCard({
       {error && <p className="text-xs text-red-600">{error}</p>}
 
       <div className="flex items-center gap-2 pt-1">
-        <input
-          type="password"
-          inputMode="numeric"
-          maxLength={8}
-          value={pin}
-          onChange={(e) => setPin(e.target.value.replace(/\D/g, ""))}
-          onKeyDown={(e) => e.key === "Enter" && submit()}
-          placeholder="Agent PIN"
-          className="flex-1 rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-sm tracking-widest text-stone-900 placeholder-stone-400 outline-none transition focus:border-stone-400 focus:bg-white"
-          autoFocus
-        />
+        {needsPin && (
+          <input
+            type="password"
+            inputMode="numeric"
+            maxLength={8}
+            value={pin}
+            onChange={(e) => setPin(e.target.value.replace(/\D/g, ""))}
+            onKeyDown={(e) => e.key === "Enter" && submit()}
+            placeholder="Agent PIN"
+            className="flex-1 rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-sm tracking-widest text-stone-900 placeholder-stone-400 outline-none transition focus:border-stone-400 focus:bg-white"
+            autoFocus
+          />
+        )}
         <button
           onClick={submit}
-          disabled={loading || pin.length < 4}
-          className="inline-flex items-center gap-1.5 rounded-xl bg-stone-900 px-3.5 py-2 text-sm font-medium text-white transition hover:bg-stone-800 disabled:opacity-50"
+          disabled={loading || (needsPin && pin.length < 4)}
+          className={`inline-flex items-center gap-1.5 rounded-xl bg-stone-900 px-3.5 py-2 text-sm font-medium text-white transition hover:bg-stone-800 disabled:opacity-50 ${needsPin ? "" : "flex-1 justify-center"}`}
         >
           {loading ? (
             <Loader2 className="h-4 w-4 animate-spin" />
@@ -402,6 +418,8 @@ function formatTaskResult(task: Task, r: TaskResultResponse): string {
         }
         return `Found a match for "${belief}" but market details were incomplete.`;
       }
+      case "RETRIEVE_TRANSACTIONS":
+        return formatRetrieveTransactions(res);
       default:
         return "✓ Done.";
     }
@@ -428,7 +446,7 @@ export default function AgentPage() {
     {
       id: "welcome",
       role: "agent",
-      text: "Hi! I'm your DotArc agent. Tell me what to do — and I can handle multiple things at once.",
+      text: "Hi! I'm your Synesis agent. Tell me what to do — and I can handle multiple things at once.",
     },
   ]);
   const [input, setInput] = useState("");
@@ -991,7 +1009,7 @@ function ChatInput({
             type="button"
             className="inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium text-stone-500 transition hover:bg-stone-100"
           >
-            DotArc Agent
+            Synesis Agent
             <ChevronDown className="h-3.5 w-3.5" />
           </button>
           <MicButton

@@ -8,7 +8,7 @@
  * Body: { arcNameLabel?: string }  — e.g. "alice-agent" (no .arc suffix). Omit to skip.
  *
  * Security:
- *  - requireAgentSession → Layer 1 (DotArc JWT) + Layer 2 (Supabase ownership)
+ *  - requireAgentSession → Layer 1 (Synesis JWT) + Layer 2 (Supabase ownership)
  *  - Idempotent: returns existing wallet if already activated
  */
 
@@ -33,10 +33,13 @@ export async function POST(req: Request) {
   const supabase = await createSupabaseServerClient();
 
   // ── Idempotency: return early if already activated ────────────────
+  // Scoped to the EVM (ARC-TESTNET) wallet — a user may now also hold a
+  // separate SOL-DEVNET row, so an unscoped maybeSingle() would throw.
   const { data: existing } = await supabase
     .from("agent_wallets")
     .select("id, circle_wallet_id, circle_wallet_address, arc_name, active")
     .eq("user_id", supabaseUserId)
+    .eq("blockchain", "ARC-TESTNET")
     .maybeSingle();
 
   if (existing) {
@@ -90,6 +93,7 @@ export async function POST(req: Request) {
     .from("agent_wallets")
     .insert({
       user_id: supabaseUserId,
+      blockchain: "ARC-TESTNET",
       circle_wallet_id: walletId,
       circle_wallet_address: walletAddress,
       arc_name: arcNameLabel,

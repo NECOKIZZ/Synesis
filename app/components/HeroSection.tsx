@@ -367,7 +367,7 @@ export default function HeroSection() {
         }}>
           <Image
             src="/dotarc.png"
-            alt="DotArc"
+            alt="Synesis"
             fill
             sizes="140px"
             style={{

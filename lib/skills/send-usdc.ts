@@ -111,6 +111,7 @@ export const SendUsdc: SkillHandler = {
         recipient_address: recipientAddress,
         recipient_arc_name: recipient.trim().startsWith("0x") ? null : normalizeName(recipient),
         amount_usdc: amount,
+        token_symbol: "USDC",
         status: "PENDING",
       })
       .select("id")

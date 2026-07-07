@@ -9,8 +9,8 @@
 import Link from "next/link";
 
 export const metadata = {
-  title: "Docs — DotArc",
-  description: "Developer documentation for DotArc — .arc names, payments, and agent integrations.",
+  title: "Docs — Synesis",
+  description: "Developer documentation for Synesis — .arc names, payments, and agent integrations.",
 };
 
 export default function DocsPage() {
@@ -82,7 +82,7 @@ export default function DocsPage() {
           }}
         >
           {[
-            { label: "Resolve a .arc name", desc: "Look up the address behind any DotArc handle." },
+            { label: "Resolve a .arc name", desc: "Look up the address behind any Synesis handle." },
             { label: "Accept USDC", desc: "Generate a pay-link or QR for any wallet." },
             { label: "Smart Agent API", desc: "Drive payments and policies from your own service." },
           ].map((card) => (

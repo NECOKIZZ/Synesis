@@ -21,6 +21,7 @@ import QRCode from "qrcode";
 import { useCircleWallet } from "@/app/circle-wallet-context";
 import { friendlyError, friendlyApiError } from "@/lib/friendly-errors";
 import { buildConversationHistory } from "@/lib/agent-history";
+import { formatRetrieveTransactions } from "@/lib/format-transactions";
 import { useSessionEndSummary } from "@/lib/memory/use-session-end-summary";
 import { MicButton } from "@/components/voice/MicButton";
 import { SpeakButton } from "@/components/voice/SpeakButton";
@@ -958,7 +959,7 @@ function AgentTab({ arcName }: { arcName: string | null }) {
   // ── Chat state ────────────────────────────────────────────────────
   const [messages, setMessages] = useState<AgentMessage[]>([{
     id: "welcome", role: "agent",
-    text: "Hi! I'm your DotArc agent. Tell me what to do — send USDC, set up recurring payments, check your balance, or update your limits.",
+    text: "Hi! I'm your Synesis agent. Tell me what to do — send USDC, set up recurring payments, check your balance, or update your limits.",
   }]);
   const [input, setInput] = useState("");
   const [interpreting, setInterpreting] = useState(false);
@@ -1091,34 +1092,10 @@ function AgentTab({ arcName }: { arcName: string | null }) {
     setMessages((prev) => prev.map((m) => m.id === id ? { ...m, ...update } : m));
   }
 
-  /**
-   * Sum of USDC required across every "now" task in the batch.
-   * Mirrors the server-side `totalUpfrontUsdc` in confirm-policy/route.ts
-   * so the client-side pre-flight matches what the server will enforce.
-   * Policy tasks (recurring / conditional) don't draw funds at confirm
-   * time — only their first scheduled execution does — so we exclude them.
-   */
-  function extractBatchUsdcAmount(ir: InterpretResult): number {
-    return ir.tasks.reduce((acc, t) => {
-      if (t.trigger.type !== "now") return acc;
-      return acc + sumStepsUsdc(t.steps);
-    }, 0);
-  }
-
-  function sumStepsUsdc(steps: PlanStep[]): number {
-    return steps.reduce((sum, step) => {
-      const raw = step.params.amount;
-      if (typeof raw === "string" && raw.startsWith("$prev")) return sum;
-      if (step.skill === "SEND_TOKEN") return sum;
-      if (step.skill === "SWAP_USDC") {
-        const tokenIn = String(step.params.tokenIn ?? "USDC").toUpperCase();
-        if (tokenIn !== "USDC") return sum;
-      }
-      if (raw === "all") return sum;
-      const a = Number(raw ?? 0);
-      return sum + (isFinite(a) && a > 0 ? a : 0);
-    }, 0);
-  }
+  // NOTE: the client no longer re-derives the batch USDC requirement. The old
+  // sumStepsUsdc used a leaky denylist that summed SET_LIMIT's cap as a spend
+  // (F-7). The server now ships the authoritative `interpret.upfront_usdc`
+  // (from the shared pin-policy SSOT), which the pre-flight below reads.
 
   /**
    * Render a single TaskResultResponse from the V3 batch endpoint into a
@@ -1253,6 +1230,8 @@ function AgentTab({ arcName }: { arcName: string | null }) {
               .join("\n")
           );
         }
+        case "RETRIEVE_TRANSACTIONS":
+          return formatRetrieveTransactions(res);
         default:
           return "✓ Done.";
       }
@@ -1295,30 +1274,40 @@ function AgentTab({ arcName }: { arcName: string | null }) {
       return;
     }
 
-    // Read-only single CHECK_BALANCE / LIST_POLICIES / IKNOW / GET_PRICE batches auto-confirm.
-    const onlyTask = interpret.tasks.length === 1 ? interpret.tasks[0] : null;
-    const onlyStep = onlyTask && onlyTask.steps.length === 1 ? onlyTask.steps[0] : null;
-    const readOnlySkills = new Set(["CHECK_BALANCE", "LIST_POLICIES", "IKNOW", "GET_PRICE"]);
-    if (onlyStep && readOnlySkills.has(onlyStep.skill)) {
-      const loadingText =
-        onlyStep.skill === "LIST_POLICIES" ? "Fetching policies…" :
-        onlyStep.skill === "IKNOW" ? "Searching prediction markets…" :
-        onlyStep.skill === "GET_PRICE" ? "Fetching live price…" :
-        "Checking balance…";
-      updateMessage(thinkingId, { text: loadingText, pending: true });
-      setPendingConfirm({ msgId: thinkingId, interpret });
-      await runConfirm(thinkingId, interpret, "");
-      return;
-    }
-
-    // Pre-flight balance guard (client-side, before PIN entry).
+    // Pre-flight balance guard (client-side, before PIN / auto-exec). Uses the
+    // SERVER-computed upfront_usdc (correct requiresBalanceCheck rule) — not a
+    // client re-derivation that mis-counted config caps (F-7). Runs first so an
+    // auto-confirmed same-user withdraw still fast-fails when short.
     const knownBalance = parseFloat(agentStatus?.wallet?.balanceUsdc ?? "0");
-    const requiredAmount = extractBatchUsdcAmount(interpret);
+    const requiredAmount = interpret.upfront_usdc ?? 0;
     if (requiredAmount > 0 && knownBalance < requiredAmount) {
       updateMessage(thinkingId, {
         text: `Insufficient balance. Your agent wallet has ${knownBalance.toFixed(2)} USDC but this batch needs ${requiredAmount.toFixed(2)} USDC. Top up from the Fund section.`,
         pending: false,
       });
+      return;
+    }
+
+    // Auto-confirm: batches that need no PIN (reads, config, and same-user money
+    // moves — withdraw-to-self, swap-in-place, self-bridge) execute immediately
+    // with no confirm card. The decision is server-computed (auto_confirm), so
+    // the client no longer keeps its own read-only allowlist (F-8 — a plain
+    // withdraw used to wrongly show a card).
+    if (interpret.auto_confirm) {
+      const onlyStep =
+        interpret.tasks.length === 1 && interpret.tasks[0].steps.length === 1
+          ? interpret.tasks[0].steps[0]
+          : null;
+      const loadingText =
+        onlyStep?.skill === "LIST_POLICIES" ? "Fetching policies…" :
+        onlyStep?.skill === "IKNOW" ? "Searching prediction markets…" :
+        onlyStep?.skill === "GET_PRICE" ? "Fetching live price…" :
+        onlyStep?.skill === "RETRIEVE_TRANSACTIONS" ? "Looking up your history…" :
+        onlyStep?.skill === "CHECK_BALANCE" ? "Checking balance…" :
+        "Working…";
+      updateMessage(thinkingId, { text: loadingText, pending: true });
+      setPendingConfirm({ msgId: thinkingId, interpret });
+      await runConfirm(thinkingId, interpret, "");
       return;
     }
 

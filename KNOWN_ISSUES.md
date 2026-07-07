@@ -1,4 +1,4 @@
-# DotArc — Known Issues & Open Items
+# Synesis — Known Issues & Open Items
 
 > **Consolidated:** 2026-06-09 · **Verification pass:** 2026-06-16 (branch `v3-hardening`)  
 > **Replaces:** `DOTARC_KNOWN_ISSUES.md`, `AUDIT_1.md`, `DOTARC_WALLET_CRITIQUE.md`, `DOTARC_FUTURE_AUDITS_AND_UPGRADES.md`, `DOTARC_AUTH_AND_SECURITY.md`  
@@ -17,13 +17,20 @@ the working tree (branch `v3-hardening`) and were verified two ways:
 
 | Issue | Stress-test symptom | Verified fix | How verified |
 |---|---|---|---|
-| 1.4 GET_PRICE bypassed | prose "no live feeds" | emits `GET_PRICE` task | trace T-013 ✅ |
+| 1.4 GET_PRICE bypassed | prose "no live feeds" | emits task **+ validator accepts it (F-14)** | trace T-013 ✅ + code 2026-07-04 |
 | 5.5 Prose escape hatch | prose instead of JSON (4×) | controlled `unknown_reason`; actions stay JSON | trace T-013/T-033/T-035 ✅ |
-| 2.9 Category-blind balance gate | `SET_LIMIT` blocked "needs 100 USDC" | `requiresBalanceCheck` flag; gate skipped | code + trace T-033 ✅ |
-| 5.6 Confirm-card / PIN scope | swap/withdraw/bridge show PIN card | `requiresPin` resolver (`pin-policy.ts`) | code ✅ |
+| 2.9 Category-blind balance gate | `SET_LIMIT` blocked "needs 100 USDC" | **Server + client fixed** — client reads server `upfront_usdc` (F-7, Phase 2) | code + trace T-033 ✅ / client ✅ |
+| 5.6 Confirm-card / PIN scope | swap/withdraw/bridge show PIN card | `requiresPin` resolver + client reads `auto_confirm` — no card for no-PIN batches (F-8, Phase 2) | code ✅ / card ✅ |
 | 2.10 Gas buffer on withdraw-all | drains to 0, next tx fails | `WITHDRAW_GAS_BUFFER_USDC` | code ✅ |
 | 4.6 / 4.11 Circle timeout/retry | 44s hang, 204s 500 | timeout + retry + circuit breaker (`circle.ts`) | code ✅ |
-| 4.10 session-end ByteString | em-dash crash, memory dead | LLM output in JSON body, not header | code ✅ |
+| 4.10 session-end ByteString | em-dash crash, memory dead | **static `X-Title` header hyphenated (F-4)** — not the LLM-body theory | code 2026-07-04 ✅ |
+
+> **2026-07-04 note:** the 2026-07-03 stress test (`STRESS_FINDINGS.md`, F-1…F-19) re-exercised
+> several rows above against the *running* build and found two that were marked ✅ on
+> v3-hardening but were **not actually closed end-to-end**: 1.4 (validator still rejected the
+> emitted task → F-14) and 2.9 (client gate still category-blind → F-7). 4.10's root cause was
+> also corrected (static header literal, not LLM summary text). Phase 0 closed 1.4/4.10; 2.9
+> client + F-8 card are Phase 2. Lesson: "trace verified emission" ≠ "verified dispatch".
 
 **Still requires live-testnet verification** (cannot be run headlessly — needs a
 logged-in session, funded agent wallet, and PIN): T-023 SEND_USDC, T-027 SWAP_USDC,
@@ -67,13 +74,19 @@ Circle App Kit chain definitions only expose `usdcAddress` and `eurcAddress` for
 
 Timeout increased from 6s → 20s. The oracle is slow; 20s is the pragmatic ceiling. If users still timeout, the oracle itself needs optimization or caching.
 
-### 1.4 GET_PRICE Skill Bypassed by LLM 🟠
+### 1.4 GET_PRICE Skill Bypassed by LLM ✅ Fixed (two layers) — 2026-07-04
 
-When asked `what's the price of Bitcoin?`, Claude classifies the request as "conversation" (due to the conversational escape hatch in the prompt) and returns prose: `I don't have access to live price feeds...` instead of emitting a `GET_PRICE` task.
+When asked `what's the price of Bitcoin?`, Claude classified the request as "conversation" (due to the conversational escape hatch in the prompt) and returned prose: `I don't have access to live price feeds...` instead of emitting a `GET_PRICE` task.
 
-- `GET_PRICE` skill is never called; no oracle or fallback is invoked.
-- Same failure for T-013 (BTC), T-014 (ETH), T-015 (DOGE).
-- **Fix:** Remove the conversational escape hatch from the interpret prompt. Force `GET_PRICE` task emission for any price query, then handle "no live feed" in the skill layer, not the LLM.
+- **Layer 1 (LLM emission) — fixed on v3-hardening:** escape hatch removed / controlled
+  `unknown_reason`; the model now emits a `GET_PRICE` task (trace T-013 ✅).
+- **Layer 2 (validator) — fixed in Phase 0 (F-14):** the emitted task was *still* being
+  rejected one layer later because `GET_PRICE` was missing from `VALID_LEAF_SKILLS`
+  (`agent-core-v3.ts`) → `unknown or non-leaf skill 'GET_PRICE'`, killing the whole batch.
+  Added to the set (`:45`). This hid behind Layer 1 — the trace verified emission, not
+  end-to-end dispatch. See `STRESS_FINDINGS.md` F-14.
+- **Follow-up (Phase 1 / D1):** a guard asserting `VALID_LEAF_SKILLS === registry keys` so
+  the catalog/validator/type/seed can't drift apart again (this exact class of bug).
 
 ### 1.5 CCTP Bridging From Arc Not Supported 🟠
 
@@ -170,14 +183,21 @@ Actual route is `app/api/circle/register-name/route.ts`. Re-checked:
 
 - **Fix:** Add Cloudflare Turnstile / hCaptcha before wallet creation
 
-### 2.9 Global Balance Gate Is Category-Blind 🔴
+### 2.9 Global Balance Gate Is Category-Blind ✅ Fixed (server + client) — 2026-07-05
 
-`checkBalanceSufficient()` in `confirm-policy` treats **every** numeric parameter as a spend amount. `SET_LIMIT` with `amount: 100` is blocked: `Insufficient balance. Your agent wallet has 4.66 USDC but this batch needs 100.00 USDC.`
+`SET_LIMIT` with `amount: 100` was blocked: `Insufficient balance... this batch needs 100.00 USDC.`
 
-- `SET_LIMIT` updates a DB row. Costs zero USDC. Should never hit a balance gate.
-- `IKNOW`, `CHECK_BALANCE`, `LIST_POLICIES` are similarly gated if they contain numeric params.
-- **Root cause:** No `requiresBalanceCheck: boolean` flag per skill. All tasks flow through the same pre-flight gate.
-- **Fix:** Add `requiresBalanceCheck: boolean` and `requiresPin: boolean` to each skill definition. Skip gate for `false`.
+- **Server — ✅ fixed:** `confirm-policy` counts only steps whose handler has
+  `requiresBalanceCheck=true` (SEND_USDC / WITHDRAW / BRIDGE_USDC). SET_LIMIT (`CONFIG`,
+  `affectsFunds:false`) is skipped. (Trace T-033.)
+- **Client — ✅ fixed (Phase 2, F-7):** the client no longer re-derives the amount at all.
+  Deleted `sumStepsUsdc`/`extractBatchUsdcAmount` from `wallet-shell.tsx`; the pre-flight now
+  reads the server-shipped `interpret.upfront_usdc` (computed by the shared `pin-policy` SSOT,
+  which both interpret and confirm-policy use — no more two-gates-that-disagree). Logic-verified:
+  `set daily 100 + monthly 10000` → `upfront_usdc = 0`.
+- **Root cause killed (D2):** server computes the gating authority and ships it; the client
+  renders it instead of maintaining a parallel (drifting) copy.
+- **Ref:** `STRESS_FINDINGS.md` F-7; `fixplan.md` Phase 2.
 
 ### 2.10 No Gas Buffer on "Withdraw All" 🟠
 
@@ -301,19 +321,31 @@ Same as 4.3 — providers instantiated at import, not on demand.
 - Retry succeeds but adds **~63s** latency.
 - **Fix:** Increase OpenRouter `fetch` timeout from 10s to 30s. Add pre-warm health check on app load.
 
-### 4.10 `session-end` Memory Crash: `ByteString` Encoding 🔴
+### 4.10 `session-end` Memory Crash: `ByteString` Encoding ✅ Fixed (Phase 0, 2026-07-04) — root cause corrected
 
-`app/api/agent/memory/session-end` fails on every session:
+`app/api/agent/memory/session-end` was failing on every session:
 
 ```
-LLM error: Cannot convert argument to a ByteString because the character at index 20
+LLM error: Cannot convert argument to a ByteString because the character at index 21
 has a value of 8212 which is greater than 255.
 ```
 
-- Character `8212` = em dash (`—`, U+2014). LLM writes summaries with em dashes.
-- The endpoint passes raw LLM output into a `ByteString` context (likely HTTP header or `FormData` field).
-- **Impact:** **Layer A memory is completely broken.** Session summaries never persisted. Agent cannot remember context between sessions.
-- **Fix:** Sanitize LLM output before passing to `ByteString` contexts. Replace Unicode em dash with ASCII hyphen (`-`). Or store summary in request body/DB directly, not in headers.
+- **Corrected root cause (2026-07-04, was wrong before):** char `8212` = em dash, and it
+  sat in the **static request header literal** `X-Title: "Synesis Smart Wallet — Memory"`
+  (`Synesis Smart Wallet ` = 21 chars → `—`), NOT in LLM-generated summary text. The prior
+  theory ("LLM writes summaries with em dashes → raw LLM output into a ByteString context")
+  was incorrect — LLM output is sent in the JSON **body** (`JSON.stringify`, unicode-safe)
+  and never touches a header.
+- **Why the v3-hardening "fix" didn't stop it:** that fix put LLM output in the body — real,
+  but it addressed a vector that wasn't the live crash. The static `X-Title` header literal
+  remained, so F-4 still fired live on 2026-07-03.
+- **Actual fix (Phase 0):** hyphenated both header literals — `session-end/route.ts:193`
+  (`- Memory`) and `:295` (`- Profile`). All header-bound strings on this path are now
+  static + Latin-1 clean. Memory Layer B (Profile) + Layer C (MemWal) populate again.
+- **Impact (was):** two of four memory layers effectively dead system-wide (every interpret
+  showed `profile=none`, `recalled=0`) until this landed. Now resolved.
+- **Ref:** `STRESS_FINDINGS.md` F-4. Live retest still worthwhile (confirm a real session
+  writes a Profile card + MemWal summary end-to-end).
 
 ### 4.11 No Circuit Breaker on Circle Failures 🟠
 
@@ -366,7 +398,15 @@ The V3 prompt (lines 115–127) explicitly teaches Claude that `unknown_reason` 
 - **Root cause:** The prompt has split personality. Lines 115–127 say "prose is fine for conversation"; line 393 says "NEVER prose." Claude picks the easier instruction.
 - **Fix:** Remove the conversational escape hatch entirely from the **interpret** prompt. Every response must be JSON. Handle "no live feed" / "insufficient balance" inside the skill layer, not the LLM. Reserve a separate prose-generation step (post-skill) for the actual UI message.
 
-### 5.6 Confirm Card Scope Bug 🟠
+### 5.6 Confirm Card Scope Bug ✅ Fixed (PIN + card) — 2026-07-05
+
+**PIN scope** was fixed earlier (`requiresPin` per skill). The remaining half — the *card
+itself* still showing for no-PIN money moves like WITHDRAW (F-8) — is fixed in **Phase 2**:
+the client's hardcoded read-only auto-confirm allowlist is gone on both surfaces
+(`wallet-shell.tsx`, `agent/page.tsx`); the card decision now reads the server-computed
+`interpret.auto_confirm` (= `!requires_pin`). No-PIN batches (reads, config, same-user
+withdraw/swap/self-bridge, and PAY_X402) auto-execute with no card; outward sends still show
+card + PIN. Ref `STRESS_FINDINGS.md` F-8, `fixplan.md` Phase 2. Original report below.
 
 Every `trigger: "now"` task shows a `ConfirmCard` + PIN prompt. But only **external sends** (`SEND_USDC` / `SEND_TOKEN` / `SEND_EURC` to another user) should require PIN confirmation.
 
@@ -491,10 +531,10 @@ These must be complete before real money is involved.
 | 19 | HMAC bind full policy params | 🟠 Open |
 | 20 | Add auth_audit_log | 🟡 Open |
 | 21 | Fix confirm card scope (only external sends need PIN) | ✅ Fixed (working tree) — needs live retest |
-| 22 | Fix category-blind balance gate (`SET_LIMIT` should not be gated) | ✅ Fixed — trace T-033 |
+| 22 | Fix category-blind balance gate (`SET_LIMIT` should not be gated) | ✅ Fixed server + client (F-7, Phase 2 — client reads server `upfront_usdc`) |
 | 23 | Remove conversational escape hatch from interpret prompt | ✅ Fixed (controlled `unknown_reason`) — trace T-013/033/035 |
 | 24 | Add gas buffer to `WITHDRAW all` (reserve ~0.1 USDC) | ✅ Fixed (`WITHDRAW_GAS_BUFFER_USDC`) — needs live retest |
-| 25 | Fix `session-end` ByteString encoding crash | ✅ Fixed (output in JSON body) — needs live retest |
+| 25 | Fix `session-end` ByteString encoding crash | ✅ Fixed (Phase 0: static `X-Title` header hyphenated, F-4) — needs live retest |
 | 26 | Add timeout + retry to all Circle SDK calls | ✅ Fixed (`circle.ts` resilience) — needs live retest |
 | 27 | Add circuit breaker for Circle API failures | ✅ Fixed (`circle.ts` circuit breaker) — needs live retest |
 | 28 | Add `requiresPin` / `requiresBalanceCheck` flags to skill registry | ✅ Fixed (all skills declare flags) |
@@ -514,3 +554,196 @@ These must be complete before real money is involved.
 | 2026-06-07 | JSON repair layer, RECURRING_PAYMENT removal, signup resilience, send modal tx-hash polling, PIN gating (outward-only), friendly errors, error boundaries | `lib/agent-core-v3.ts`, `app/circle-wallet-context.tsx`, `app/auth/callback/route.ts`, etc. |
 | 2026-06-09 | IKNOW formatter prioritizes verdict over success; oracle timeout 6s→20s | `app/agent/page.tsx`, `app/wallet/wallet-shell.tsx`, `lib/skills/iknow.ts` |
 | 2026-06-12 | **Stress Test Session (Diagnostic):** Identified 11 critical issues: confirm card scope bug, category-blind balance gate, LLM prose hallucinations (prompt split personality), no gas buffer on withdraw-all, `session-end` ByteString crash, Circle API `socket hang up` / no timeout, serial skill execution, redundant balance calls, OpenRouter connect timeout, CCTP Arc source unsupported, cirBTC address null. Documented in `KNOWN_ISSUES.md` sections 1.4–1.5, 2.9–2.10, 4.6–4.11, 5.5–5.6. | `dotarc-stress-test.md`, `KNOWN_ISSUES.md` |
+
+---
+
+# Appendix — Mainnet Hardening Checklist
+
+> Items safe to ship for hackathon / testnet but that MUST be addressed before mainnet launch. Kept distinct from the active-bug list above.
+
+# Mainnet Hardening Checklist
+
+Issues that are **safe to ship for hackathon / testnet** but **must be addressed before mainnet launch**. Each item lists the symptom, the root cause, the location, and the proposed fix.
+
+This file is the source of truth for "what's left before real money flows through this." Don't bury this stuff in `KNOWN_ISSUES.md` — that file is for active bugs against the running V3 build.
+
+---
+
+## Auth & Identity
+
+### 🔴 H2 — `USER_ID_PEPPER` must be treated as immutable in production
+
+**Symptom**
+Every existing user appears as a brand-new user. Their Circle wallets still exist, but our app can't find them. Funds appear "missing" — they're not, but the user thinks they are.
+
+**Root cause**
+`userIdFromEmail()` derives the Circle userId by HMAC-SHA256(pepper, email). Rotating the pepper changes the derivation. We DO pin `profiles.circle_user_id` at first signup as a safeguard — so users **with a profile row are safe**. But users who:
+- Started signup but never completed (no profile row yet)
+- Had their profile row deleted (manual cleanup, RLS misconfig)
+- Predate the `circle_user_id` column
+
+…are orphaned forever after a pepper rotation.
+
+**Where**
+- `@lib/circle.ts:223-260` — `userIdFromEmail` + `resolveCircleUserId`
+
+**Fix**
+1. **Document in `.env.local.example`**: `USER_ID_PEPPER` is set-once. Rotating it in production orphans existing users.
+2. (Optional, defense-in-depth) On every successful sign-in for a user without a profile row, try BOTH derivations (current pepper + last-known pepper) against `listWallets` and adopt whichever finds a wallet. Requires keeping a `USER_ID_PEPPER_PREVIOUS` env var during the rotation window.
+3. Backfill any `profiles` rows missing `circle_user_id` from the legacy SHA-256 derivation before the next rotation.
+
+---
+
+### 🟠 M1 — Profile upsert silently overwrites `circle_user_id` and `wallet_address`
+
+**Symptom**
+If Circle ever returns a different wallet for the same userId (their bug, race condition, partial outage), our app silently follows along. The user's original wallet record is gone from our DB; their original funds appear lost. They're still on Circle, but we've forgotten about them.
+
+**Root cause**
+`upsertProfileForCurrentUser` blindly upserts both columns on every fast-path sign-in.
+
+**Where**
+- `@lib/profile.ts:85-116`
+
+**Fix**
+Treat `circle_user_id` and `wallet_address` as **set-once after first write**. On every subsequent call:
+- If the row already has these set and the new values match → no-op.
+- If the values **don't match** → refuse the write, log a hard alert (Sentry/PagerDuty), and surface a 500 to the client. This is an "impossible" state that warrants human review.
+
+Only `email` should remain mutable through this code path.
+
+---
+
+### 🟠 M2 — Email typos create permanent dead accounts
+
+**Symptom**
+`john@gmial.com` (typo) is a syntactically valid email. The user verifies the code (Gmail bounces it to their real inbox or it goes to a spam trap), gets a wallet, and never returns. A small percentage of every signup cohort becomes orphan accounts with funded wallets.
+
+**Root cause**
+`signInWithOtp({ shouldCreateUser: true })` accepts any well-formed email. We don't validate domain plausibility or warn on common typos.
+
+**Where**
+- `@app/auth-gate.tsx:133-136`
+
+**Fix**
+1. Use a small typo-detection library (e.g. `mailcheck`) to suggest corrections on submit: "Did you mean `john@gmail.com`?"
+2. (Optional) Sanity-check MX records server-side before accepting the OTP request.
+3. Reject obvious garbage (`test@test.com`, etc.) in low-risk hackathon mode; production should be more permissive.
+
+---
+
+### 🟠 A5 — Stale Supabase session sticks across "use a different account" attempts
+
+**Symptom**
+User starts signing in with `alice@example.com`, cancels mid-flow. Returns to `/wallet` later wanting to use `bob@example.com`. The Supabase cookie from Alice's verified session is still valid — `AuthGate.getClaims()` finds it on mount and auto-fires `onVerified("alice@example.com")` before Bob ever sees the email input. Bob ends up in Alice's account.
+
+**Root cause**
+Supabase sessions persist across page reloads. AuthGate treats any valid session as "user is signed in, skip the gate."
+
+**Where**
+- `@app/auth-gate.tsx:52-89` — auto-fire logic
+
+**Fix**
+On the auth gate, when a Supabase session exists:
+- Show the email at the top: "Continuing as `alice@example.com`"
+- Add a "Use a different account" link that calls `supabase.auth.signOut({ scope: "local" })` and returns to the email picker
+- (Optional) Auto-expire Supabase sessions older than N minutes that never completed a Circle flow
+
+---
+
+### 🟠 M3 — Realtime listener can race the polling loop during onboarding recovery
+
+**Symptom**
+During slow onboardings, two recovery paths fire simultaneously:
+1. The polling loop in `startCircleFlow` finds the wallet via `/api/circle/wallet`.
+2. The Supabase Realtime listener on `profiles.wallet_address` re-invokes `startCircleFlow` from scratch.
+
+Both call `POST /api/circle/session`, minting two cookies back-to-back. Last write wins, so no correctness issue — but logs are noisy and we're doing 2× the server work on a path that should be cheap.
+
+**Where**
+- `@app/circle-wallet-context.tsx:238-448` — `startCircleFlow`
+- `@app/circle-wallet-context.tsx:512-550` — Realtime subscription
+
+**Fix**
+Add an `inFlightRef` boolean inside `startCircleFlow`. Bail at the top of the function if already running. Cheap, ~10-line change.
+
+---
+
+## Performance & Resilience
+
+### 🟡 L1 — `/api/agent/status` is hammered by multiple unrelated surfaces
+
+**Symptom**
+On every wallet page mount, `/api/agent/status` is hit 4-8 times in quick succession. Each call does:
+- JWT verification
+- Invite-gate lookup
+- Possibly a Circle balance refresh (gated to 30s cache)
+- 3 separate Supabase queries
+
+Result: 1-2s per call, sometimes longer. Annoying in dev; would be a real bill in production.
+
+**Root cause**
+Three independent surfaces (`wallet/page.tsx`, `wallet/wallet-shell.tsx`, `agent/page.tsx`) each fetch on mount. Two of them also subscribe to Supabase Realtime that re-fetches on every DB change.
+
+**Where**
+- `@app/wallet/wallet-shell.tsx:973-991, 1065-1075, 2022-2028`
+- `@app/agent/page.tsx:442-463`
+- `@app/wallet/page.tsx:95-105`
+
+**Fix**
+1. Adopt SWR or React Query at the `/api/agent/status` boundary, with dedupe-interval ≥ 2s.
+2. Lift the status fetch to a single context provider so all consumers share one in-flight request.
+3. Move the heavy "recent activity + policies" portion to a separate endpoint that only the agent page calls.
+
+---
+
+### 🟡 L2 — OAuth callback `?next=` is hardcoded to `/wallet`
+
+**Symptom**
+If we ever add a sign-in entry from `/agent` or `/settings`, the user lands on `/wallet` after Google OAuth instead of where they started.
+
+**Where**
+- `@app/auth-gate.tsx:112-115`
+
+**Fix**
+Pass the current path as `?next=` when calling `signInWithOAuth`, and validate it server-side in `auth/callback/route.ts` (must be a relative path, no protocol).
+
+---
+
+## Operational
+
+### Pre-mainnet ops checklist (non-code)
+
+These aren't code bugs — they're things that need to exist before mainnet:
+
+- [ ] Document `USER_ID_PEPPER` immutability in `.env.local.example` (covers H2)
+- [ ] Add a `USER_ID_PEPPER_PREVIOUS` mechanism for emergency rotation (defense-in-depth)
+- [ ] Set up Sentry / error tracking — required for M1's hard-alert fix
+- [ ] Set up uptime monitoring on `/api/agent/status` and `/api/circle/init-user`
+- [ ] Document the OTP rate-limit story (Supabase free tier has tight limits)
+- [ ] Audit Supabase RLS on `profiles`, `agent_wallets`, `agent_spend_log`, `agent_idempotency`
+- [ ] Verify Circle webhook signature validation under load (currently single-key fetch per webhook — should be cached)
+
+---
+
+## Priority order (for the day we decide "we're going to mainnet")
+
+1. **H2 doc change** — 1 line, do today regardless
+2. **M1 set-once profile** — 10 lines, hardens against the worst kind of silent data loss
+3. **A5 "use a different account"** — visible UX bug, easy fix
+4. **M3 inFlightRef** — defensive, prevents wasted work
+5. **L1 status dedupe** — perf win, real bills on production
+6. **M2 typo detection** — UX polish, not a correctness bug
+7. **L2 next-path** — only matters when we add more sign-in entry points
+
+---
+
+## What's already fixed (don't redo)
+
+These were in the original audit but have since been closed:
+
+- ✅ **H1 — `listWallets` silent fall-through** — fixed in `@lib/circle.ts:308-320`. We now hard-fail and let the client's `fetchJsonWithRetry` retry the whole flow.
+- ✅ **Email server-trust** — `init-user` reads email from the verified Supabase session, never from the body. Prevents the "anyone with an email can sign in" bug.
+- ✅ **OAuth callback PKCE recovery** — `@app/auth/callback/route.ts:52-73` handles "code already used" gracefully.
+- ✅ **`AuthGate` firedRef** — prevents remount loops on failed Circle flows.
+- ✅ **Logout clears both Supabase + dotarc sessions** — kills the "can't log out" zombie loop.

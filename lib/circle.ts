@@ -65,7 +65,7 @@ export class CircleUnavailableError extends Error {
 }
 
 const RETRYABLE =
-  /socket hang up|ECONNRESET|ETIMEDOUT|timed out|fetch failed|network|EAI_AGAIN|ENOTFOUND|\b50[234]\b/i;
+  /socket hang up|ECONNRESET|ETIMEDOUT|timed out|fetch failed|network|EAI_AGAIN|ENOTFOUND|(?:HTTP|status(?:\s*code)?)\s*50[234]\b/i;
 
 // Module-level breaker state (per server instance).
 let cbConsecutiveFailures = 0;

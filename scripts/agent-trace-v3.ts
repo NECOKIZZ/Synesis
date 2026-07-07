@@ -138,7 +138,7 @@ async function main() {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
       "HTTP-Referer": referer,
-      "X-Title": "DotArc Smart Wallet (Trace V3)",
+      "X-Title": "Synesis Smart Wallet (Trace V3)",
     },
     body: JSON.stringify({
       model: model ?? "anthropic/claude-3.5-sonnet",

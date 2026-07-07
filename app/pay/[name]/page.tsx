@@ -39,7 +39,7 @@ export default async function PayPage({ params }: Props) {
         {/* Header stripe */}
         <div className="bg-gradient-to-r from-blue-600 to-blue-700 px-6 py-5">
           <div className="text-xs font-semibold uppercase tracking-wider text-blue-100">
-            DotArc · Arc Testnet
+            Synesis · Arc Testnet
           </div>
           {displayName ? (
             <div className="mt-1 text-2xl font-bold text-white">
@@ -74,7 +74,7 @@ export default async function PayPage({ params }: Props) {
                 href={walletDeepLink}
                 className="mt-5 flex w-full items-center justify-center gap-2 rounded-xl bg-zinc-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-zinc-700 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-100"
               >
-                Open DotArc wallet to send
+                Open Synesis wallet to send
                 <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
                 </svg>
@@ -93,7 +93,7 @@ export default async function PayPage({ params }: Props) {
                 href={walletDeepLink}
                 className="mt-4 inline-block text-sm text-blue-600 hover:underline dark:text-blue-400"
               >
-                Go to DotArc →
+                Go to Synesis →
               </Link>
             </div>
           )}
@@ -106,7 +106,7 @@ export default async function PayPage({ params }: Props) {
 export async function generateMetadata({ params }: Props) {
   const { name } = await params;
   return {
-    title: `Pay ${name} · DotArc`,
-    description: `Send USDC to ${name} on Arc Testnet via DotArc wallet`,
+    title: `Pay ${name} · Synesis`,
+    description: `Send USDC to ${name} on Arc Testnet via Synesis wallet`,
   };
 }

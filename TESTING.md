@@ -1,4 +1,15 @@
-# DotArc Smart Agent — Full Stress Test Suite
+# Synesis — Test Suites
+
+Consolidated test documentation. Three suites:
+- **Part I** — full skills / intelligence / security stress test.
+- **Part II** — memory-stack stress test.
+- **Part III** — V3 pre-push smoke test.
+
+---
+
+# PART I — Skills / Intelligence / Security Stress Test
+
+# Synesis Smart Agent — Full Stress Test Suite
 
 > **Version:** 1.0 — Based on Architecture v2026-06-09  
 > **Scope:** All 13 skills, agent intelligence, error paths, edge cases, compound tasks, policy engine, memory, security layers  
@@ -32,7 +43,7 @@ For every FAIL, record: what the agent returned, what it should have returned, a
 
 **Failure signal:** Agent tries to execute a skill, returns blank response, or returns an error.
 
-**Actual Response:** Hi there! I'm your DotArc wallet assistant. I can help you send crypto, swap tokens, set up recurring payments, manage spending limits, and answer questions about crypto and finance. What would you like to do today?
+**Actual Response:** Hi there! I'm your Synesis wallet assistant. I can help you send crypto, swap tokens, set up recurring payments, manage spending limits, and answer questions about crypto and finance. What would you like to do today?
 
 ---
 
@@ -44,7 +55,7 @@ For every FAIL, record: what the agent returned, what it should have returned, a
 
 **Failure signal:** Agent lists skills by their code names (SEND_USDC, GET_PRICE) instead of human descriptions. Or returns a JSON task object.
 
-**Actual Response:** I'm your DotArc wallet assistant! Here's what I can help you with: **Wallet Actions:** • Send USDC, EURC, or cirBTC to anyone • Swap between supported tokens (USDC ↔ EURC ↔ cirBTC) • Bridge USDC to other chains • Set up recurring payments (daily, weekly, monthly) • Create price-triggered trades (buy/sell when price hits a target) • Check your balance and transaction history • Adjust spending limits • Withdraw funds back to your main wallet • Pay for x402-enabled APIs • Find prediction markets for your opinions **Crypto & Finance Help:** • Explain concepts like staking, DeFi, gas fees, bridging • Discuss token safety and diversification strategies • Help you understand market mechanics • Answer questions about different exchanges and protocols Your current balance: ~$10.19 USDC, ~$0.41 EURC Spending limits: $50/transaction, $100/day, $300/week, $500/month What would you like to do? Just tell me in plain English!
+**Actual Response:** I'm your Synesis wallet assistant! Here's what I can help you with: **Wallet Actions:** • Send USDC, EURC, or cirBTC to anyone • Swap between supported tokens (USDC ↔ EURC ↔ cirBTC) • Bridge USDC to other chains • Set up recurring payments (daily, weekly, monthly) • Create price-triggered trades (buy/sell when price hits a target) • Check your balance and transaction history • Adjust spending limits • Withdraw funds back to your main wallet • Pay for x402-enabled APIs • Find prediction markets for your opinions **Crypto & Finance Help:** • Explain concepts like staking, DeFi, gas fees, bridging • Discuss token safety and diversification strategies • Help you understand market mechanics • Answer questions about different exchanges and protocols Your current balance: ~$10.19 USDC, ~$0.41 EURC Spending limits: $50/transaction, $100/day, $300/week, $500/month What would you like to do? Just tell me in plain English!
 
 ---
 
@@ -685,7 +696,7 @@ I don't have access to live price feeds, so I can't tell you Arc's current price
 
 ## Section 5 — POLICY Skills
 
-*Policies are the most architecturally complex part of DotArc. Test creation, listing, cancellation, and execution thoroughly.*
+*Policies are the most architecturally complex part of Synesis. Test creation, listing, cancellation, and execution thoroughly.*
 
 ---
 
@@ -887,7 +898,7 @@ Both presented to user for confirmation. Each confirmed and executed independent
 
 **Failure signal:** Three separate tasks generated instead of one three-step plan. $prev not chained across steps. Wrong steps generated.
 
-**Findings/Actual Response** "## DotArc Stress Test — Session Findings Summary
+**Findings/Actual Response** "## Synesis Stress Test — Session Findings Summary
 
 **Date:** June 12, 2026  
 **Tester:** necokizz  
@@ -992,7 +1003,7 @@ Two tasks, different types, from one message.
 
 ### T-069 — L1: Expired Session
 
-**Setup:** DotArc JWT cookie has expired.
+**Setup:** Synesis JWT cookie has expired.
 
 **Input:** Any instruction.
 
@@ -1004,11 +1015,11 @@ Two tasks, different types, from one message.
 
 ### T-070 — L1: Session Swap Attack
 
-**Setup:** User A's DotArc JWT is presented alongside User B's Supabase JWT (email mismatch between tokens).
+**Setup:** User A's Synesis JWT is presented alongside User B's Supabase JWT (email mismatch between tokens).
 
 **Input:** Any instruction.
 
-**Expected:** requireAgentSession() detects email mismatch between DotArc JWT and Supabase JWT. Request rejected.
+**Expected:** requireAgentSession() detects email mismatch between Synesis JWT and Supabase JWT. Request rejected.
 
 **Failure signal:** Request proceeds. User A gains access to User B's wallet.
 
@@ -1399,7 +1410,7 @@ Two tasks, different types, from one message.
 
 ---
 
-*DotArc Stress Test Suite v1.0 — Generated 2026-06-10 — Based on Architecture v2026-06-09*
+*Synesis Stress Test Suite v1.0 — Generated 2026-06-10 — Based on Architecture v2026-06-09*
 
 withdraw every single money you have on you to my wallet
 ✗ Step 1 failed: The withdrawal didn't go through. No money has left your wallet. You can try again — if the problem keeps happening, contact support.. No tokens have moved.
@@ -1410,3 +1421,555 @@ withdraw all my usdc to my wallet
 window also loads anytime a skill is successfully executed which is kinda weird.
 
 I told it to send money to a name and inputted the wrong pin. I told it to let me try again but it didnt understand. Please ensure session memory works fine
+---
+
+# PART II — Memory Stress Test
+
+# Synesis — Memory Stress Test Suite
+
+> **Version:** 1.0 — Memory architecture (v3.5 + contact_mem + user_profile + MemWal)
+> **Scope:** The full memory stack — what gets injected, when, whether it updates correctly, and whether the LLM uses intent + memory + state coherently.
+> **Companion docs:** `MEMORY_ARCHITECTURE.md` (architecture), `dotarc-stress-test.md` (skills/security).
+
+---
+
+## What This Suite Tests
+
+This is NOT a skills test. It tests the **memory engine** around the skills:
+
+1. **Right stuff, right time** — does the correct memory layer get injected for a given intent, and NOT the wrong ones? ("hello" must inject no contact memory; "send to sara" must.)
+2. **Memory updates correctly** — after a confirmed transfer, does `agent_contact_mem` move by exactly the right amount, once, in the right direction?
+3. **LLM handles intent + memory + state together** — does it resolve "sara" from memory, respect the profile's style, and read live state without confusing the three?
+
+The primary instrument is **logs**. Every memory decision is logged; each test below names the exact log line(s) that prove pass/fail.
+
+---
+
+## The Memory Architecture Under Test
+
+Four layers, each with a different store, cadence, and trigger:
+
+| # | Layer | Store | Injected when | Written when | Flag |
+|---|---|---|---|---|---|
+| 1 | Identity | `profiles.arc_name` | always | registration | `AGENT_IDENTITY_INJECT` |
+| 2 | User profile (style + standing prefs) | `user_profile` (1 curated card) | always | session-end (LLM merge) | `USER_PROFILE_ENABLED` |
+| 3 | Contact stats (who/how much) | `agent_contact_mem` | intent-gated (router picks SEND_USDC/SEND_TOKEN) | Circle webhook on confirmed transfer (deterministic) | `CONTACT_MEM_INJECT` |
+| 4 | Episodic learned facts (prefs, open loops, notes) | MemWal (Walrus) | semantic recall (top-3) | session-end (LLM summary) + "remember this" | `MEMWAL_ENABLED` |
+
+**Key dependency:** contact-memory injection (layer 3) is gated off the **skill router's** output. The router MUST be on (`SKILL_ROUTER_ENABLED=true`) or contact memory never injects, regardless of `CONTACT_MEM_INJECT`.
+
+---
+
+## Preconditions — DO THIS FIRST (tests fail silently otherwise)
+
+### 0.1 — Migrations applied
+Apply through `0018`:
+```
+0013_agent_balance_cache_multi   0014_skill_embeddings
+0015_agent_contact_mem           0016_spend_log_token_symbol
+0017_drop_user_memory            0018_user_profile
+```
+Verify:
+```sql
+select to_regclass('public.agent_contact_mem');   -- not null
+select to_regclass('public.user_profile');         -- not null
+select to_regclass('public.user_memory');          -- NULL (dropped)
+select to_regclass('public.skill_embeddings');     -- not null
+```
+
+### 0.2 — Env flags (`.env.local`)
+```
+# Core V3.5
+SKILL_ROUTER_ENABLED=true        # REQUIRED — contact memory depends on it
+SKILL_ROUTER_K=6
+SKILL_ROUTER_MIN_COSINE=0.4
+RETRIEVE_TRANSACTIONS_ENABLED=true
+BALANCE_CACHE_ENABLED=true
+AGENT_IDENTITY_INJECT=true
+# Memory layers
+CONTACT_MEM_INJECT=true
+USER_PROFILE_ENABLED=true
+MEMWAL_ENABLED=1
+# Secrets the above need
+OPENAI_API_KEY=sk-...            # REQUIRED for skill router embeddings + seed
+MEMWAL_PRIVATE_KEY=...           MEMWAL_ACCOUNT_ID=...   MEMWAL_SERVER_URL=...
+```
+> ⚠️ **Known gap at time of writing:** `OPENAI_API_KEY` is empty and the four memory flags are absent in `.env.local`. Set them before running. Without `OPENAI_API_KEY`, the router falls back to the full catalog on every call — you'll see `[skill-router] embedding failed` and contact memory will still work (full catalog includes SEND_USDC) but the router test (M-G group) is invalid.
+
+### 0.3 — Seed the skill embeddings
+```
+npm run seed:skills
+```
+(loads `.env.local`, embeds via OpenRouter, upserts `skill_embeddings`.) Expect `✓ Seeded 13/13 skills`. Verify: `select count(*) from skill_embeddings;` → 13.
+
+**Embeddings provider:** this project routes embeddings through **OpenRouter** (reuses `OPENROUTER_API_KEY` — no OpenAI account needed) via `OPENAI_API_BASE=https://openrouter.ai/api` + `EMBEDDING_MODEL=openai/text-embedding-3-small`. To use OpenAI directly instead, set `OPENAI_API_KEY=sk-…` and remove those two vars.
+
+### 0.4 — MemWal reachability
+The adapter is gated + non-throwing, so a bad config looks like "no memory" not an error. Confirm a write settles before trusting recall tests — see M-D1.
+
+### 0.5 — Watch the logs
+Run `npm run dev` and keep the server console visible. Every test is judged primarily on log output. The anchor is the **9-line diagnostics block** printed on every `/interpret` call:
+```
+┌─ INTERPRET DIAGNOSTICS trace=… ─
+  │ 1 IDENTITY      user=…  inject=on profile=…ch | …
+  │ 2 WALLET STATE  source=cache|live … | USDC=… …
+  │ 3 SPEND LIMITS  …
+  │ 4 POLICIES      …
+  │ 5 HISTORY       turns=… …
+  │ 6 TOOL SCHEMA   router=on top=… fallback=… | [skills]
+  │ 7 LIVE PRICES   …
+  │ 8 MEMORY        memwal on, recalled=N fact(s)
+  │ 9 CONTACT MEM   injected=yes|no …
+  └─
+```
+
+### Marking
+- ✅ PASS — log lines + LLM behavior exactly as expected
+- ❌ FAIL — wrong injection, wrong/duplicate update, or crash
+- ⚠️ PARTIAL — correct but degraded (e.g. router fell back when it shouldn't)
+- 🔁 SKIP — environment limitation (MemWal relayer down, etc.)
+
+For every FAIL, capture: the full diagnostics block, the relevant `[memory]`/`[contact-mem]`/`[memwal]` lines, and whether it failed at **inject** (interpret) or **update** (confirm/webhook).
+
+---
+
+## Section A — Injection Gating (right stuff, right time)
+
+*The core thesis: memory injection is driven by the skill router's intent classification. The right layer fires; the wrong ones stay silent.*
+
+### M-A1 — Greeting injects no transactional memory
+**Input:** `hi`
+**Expect (diagnostics):**
+- Line 9 `CONTACT MEM injected=no (intent not transactional)`
+- Line 6 router selected a conversational/non-transfer skill set
+- `[mem-inject]` line: absent (no contact bucket triggered)
+**Pass:** contact memory NOT injected. Identity + profile (lines 1) still present.
+**Fail:** `9 CONTACT MEM injected=yes` on a greeting → over-injection.
+
+### M-A2 — Send intent injects contact digest
+**Precondition:** at least one prior confirmed send exists (run M-C1 first, or seed).
+**Input:** `send 5 usdc to sara`
+**Expect:**
+- Line 6 `[SEND_USDC, …]`
+- Line 9 `injected=yes bucket=contact trigger=SEND_USDC count=N`
+- Log `[mem-inject] bucket=contact trigger=SEND_USDC → injected N contact(s)`
+**Pass:** the `CONTACTS YOU'VE DEALT WITH` block is built; sara appears if known.
+**Fail:** `injected=no` despite a SEND intent → gating broken or router missed SEND_USDC.
+
+### M-A3 — Price question injects nothing transactional
+**Input:** `what's the price of btc?`
+**Expect:** Line 6 `[GET_PRICE]`; Line 9 `injected=no`. No `[mem-inject]` line.
+**Pass:** GET_PRICE routes clean, no contact memory.
+
+### M-A4 — History query is NOT contact injection
+**Input:** `how much have I sent sara?`
+**Expect:** router picks `RETRIEVE_TRANSACTIONS` (not SEND_USDC). Line 9 `injected=no` — RETRIEVE_TRANSACTIONS is not a contact-feeding skill; the data comes from the skill call, not injection.
+**Pass:** distinguishes "act on a contact" (inject) from "query history" (skill). This is a subtle one — RETRIEVE_TRANSACTIONS deliberately does NOT trigger the contact bucket.
+**Fail:** contact digest injected here → the skill→bucket map is too greedy.
+
+### M-A5 — New user, send intent, empty memory
+**Precondition:** fresh user, zero contacts.
+**Input:** `send 5 to maya`
+**Expect:** Line 9 `injected=no`; log `[mem-inject] bucket=contact trigger=SEND_USDC → no contacts yet (nothing injected)`.
+**Pass:** graceful empty — bucket triggered, nothing to inject, no crash.
+
+---
+
+## Section B — User Profile (always-on personalization)
+
+### M-B1 — Profile injects on every intent (even greetings)
+**Precondition:** a profile card exists (run M-B3 first to create one).
+**Input:** `hi`
+**Expect:** Line 1 `… profile=Nch` (N>0); prompt contains `ABOUT THIS USER` block.
+**Pass:** profile present on a non-transactional message — proves it's always-on, NOT intent-gated like contact memory.
+**Fail:** `profile=none` when a card exists → fetch broke, or flag off.
+
+### M-B2 — No card → no block, no crash
+**Precondition:** fresh user, no `user_profile` row.
+**Input:** `hi`
+**Expect:** Line 1 `profile=none`; log `[profile] no card yet`. No `ABOUT THIS USER` block in prompt.
+**Pass:** clean omission.
+
+### M-B3 — Profile is created from a session
+**Steps:**
+1. Have a multi-turn session that clearly demonstrates a durable style, e.g.:
+   - `just send 5 to bob, no need to explain`
+   - `i always want the fastest option, skip the confirmations`
+2. Trigger session-end (close the tab, or POST `/api/agent/memory/session-end` with the history).
+**Expect logs:**
+- `[memory/session-end] trace=… profile updated length=… preview="…"`
+**Verify:** `select profile_card from user_profile where user_id=…;` → contains a terse/standing-pref style note, NOT the literal transactions.
+**Pass:** durable style captured; no amounts/actions leaked into the card.
+**Fail:** card contains "sent 5 to bob" → ACTIONS leaked (should be excluded).
+
+### M-B4 — Profile MERGES, doesn't append
+**Steps:** after M-B3, run a second session expressing a NEW preference (e.g. `i prefer EURC`), trigger session-end.
+**Expect:** `[memory/session-end] profile updated …`; card now reflects BOTH style and EURC pref, deduped — not two stacked copies.
+**Pass:** card stays short and merged (under ~400 chars).
+**Fail:** card grows by appending duplicates each session → merge prompt failing.
+
+### M-B5 — No durable signal → no write
+**Steps:** session with only transactional chatter (`send 5 to bob`, `check balance`), trigger session-end.
+**Expect:** `[memory/session-end] profile unchanged`. No upsert.
+**Pass:** nothing durable → card untouched (no hallucinated preferences).
+
+---
+
+## Section C — Contact Memory Updates (deterministic, idempotent)
+
+*These are the hard-fact statistics. They must update from the webhook on confirmed transfers, exactly once, never from the LLM.*
+
+### M-C1 — A confirmed send creates/updates a contact row
+**Steps:** send `5 USDC to sara`, confirm with PIN, let it settle (Circle webhook fires).
+**Expect log:** `[contact-mem] recorded out USDC $5 → sara.arc (skill=SEND_USDC)`
+**Verify:**
+```sql
+select counterparty_alias, send_count, total_sent_usd, by_token, last_skill
+from agent_contact_mem where counterparty_alias='sara';
+```
+→ `send_count=1, total_sent_usd=5, by_token={"USDC":{"sent":5,"recv":0,"count":1}}`.
+**Pass:** row created with correct direction + amount.
+**Fail:** no log / no row → webhook not wired or not firing. Row but wrong amount → valuation bug.
+
+### M-C2 — Idempotency: re-delivered webhook does NOT double-count
+**Steps:** after M-C1, replay the same Circle webhook notification (same `circle_tx_id`).
+**Expect:** NO new `[contact-mem] recorded` line (the re-delivery hits the `byCircleId` branch and skips the bump).
+**Verify:** `send_count` still `1`, `total_sent_usd` still `5`.
+**Pass:** counter unchanged on replay.
+**Fail:** send_count=2 → idempotency broken (the bump moved out of the first-transition branch).
+
+### M-C3 — Second distinct send increments
+**Steps:** send another `3 USDC to sara`, confirm, settle.
+**Verify:** `send_count=2, total_sent_usd=8, by_token.USDC.count=2`.
+**Pass:** monotonic, correct running totals.
+
+### M-C4 — Inbound receive updates the other direction
+**Steps:** have sara (or any address) send USDC TO the agent wallet; webhook records a RECEIVE.
+**Expect log:** `[contact-mem] recorded in USDC $… ← …`
+**Verify:** `receive_count` and `total_received_usd` move; send side untouched.
+**Pass:** direction correctly separated.
+
+### M-C5 — Non-USDC send values in USD, tags the token
+**Precondition:** `0016` applied (token_symbol column).
+**Steps:** send `10 EURC to maya`, confirm, settle.
+**Expect log:** `[contact-mem] recorded out EURC $10.8 → maya.arc` (10 × 1.08).
+**Verify:** `by_token` has an `EURC` bucket with `sent≈10.8`; `total_sent_usd` rolled up in USD.
+**Pass:** per-token bucket + USD rollup both correct.
+**Fail:** valued at $10 (raw amount, no rate) → the webhook isn't reading token_symbol.
+
+### M-C6 — WITHDRAW does NOT create a contact
+**Steps:** withdraw USDC from agent wallet to your own main wallet, settle.
+**Expect:** NO `[contact-mem] recorded` line (WITHDRAW is skipped — counterparty is yourself).
+**Verify:** no row for your main wallet address in agent_contact_mem.
+**Pass:** self-transfers excluded.
+**Fail:** a contact row appears for your own wallet → the WITHDRAW skip guard failed.
+
+### M-C7 — LLM never writes contact memory
+**Steps:** in any interpret call, observe there is NO `[contact-mem] recorded` line at interpret time — only after the webhook confirms.
+**Pass:** confirms the "counters are deterministic, never LLM" invariant. Interpret (the LLM call) must never move a counter.
+
+---
+
+## Section D — MemWal Episodic (semantic recall + write)
+
+### M-D1 — "Remember this" writes to MemWal
+**Input:** `remember that I hate paying gas fees`
+**Expect logs:**
+- `[agent/interpret] … remembered note (memwal=yes)`
+- `[memwal] remember accepted job=… chars=… preview="[note] (YYYY-MM-DD) I hate paying gas fees"`
+- (seconds later) `[memwal] remember settled job=…`
+**Pass:** note stored, dated, tagged `[note]`, settles.
+**Fail:** `memwal=no` → MemWal gate off/misconfigured. `accepted` but never `settled` → relayer issue (🔁 SKIP downstream recall tests).
+
+### M-D2 — Recall surfaces the stored note
+**Precondition:** M-D1 settled.
+**Input:** `should I bridge to base?` (semantically near "fees")
+**Expect:** Line 8 `memwal on, recalled=N fact(s)` with N≥1; log `[memwal] recall q="should i bridge…" hits=N/3 scores=[…]`. The gas-fee note should appear in the recalled set (check scores).
+**Pass:** relevant fact recalled, injected into `memoryContext`.
+**Fail:** `recalled=0` on a clearly related query → embedding/namespace mismatch.
+
+### M-D3 — Irrelevant query recalls little/nothing
+**Input:** `what's the price of eth?`
+**Expect:** Line 8 low/zero recall; this is fine — semantic self-gating. Price questions shouldn't pull the gas-fee note strongly.
+**Pass:** no spurious high-score recall of unrelated facts.
+
+### M-D4 — Session-end summary is stored, dated, action-free
+**Steps:** multi-turn session mixing actions + a stated preference + an unfinished ask (e.g. `what's cirBTC at?` then never buy). Trigger session-end.
+**Expect log:** `[memory/session-end] … stored=true date=YYYY-MM-DD length=… preview="…"`
+**Verify (recall it next session):** the summary contains PREFERENCES / OPEN LOOPS / TONE — and NOT completed actions/amounts.
+**Pass:** open loop ("asked about cirBTC, didn't buy") captured; no action ledger duplicated.
+**Fail:** summary lists "sent 5 to bob" → ACTIONS leaked into Walrus (duplication + hallucination risk).
+
+### M-D5 — Introspection reads MemWal only
+**Input:** `what do you remember about me?`
+**Expect:** friendly numbered list built from `[memwal] recall …` (15-limit query). Tags (`[note]`, `[session-summary]`) stripped in the display.
+**Pass:** clean list, no Supabase/user_memory reference (that table is gone).
+**Fail:** error or empty when notes exist → introspection path broken.
+
+### M-D6 — Two LLM calls at session-end, both backgrounded
+**Steps:** trigger one session-end with both `MEMWAL_ENABLED=1` and `USER_PROFILE_ENABLED=true`.
+**Expect:** exactly two background completions — one summary (`stored=…`), one profile (`profile updated|unchanged`). Route returns 204 immediately (client never blocks).
+**Pass:** both fire, neither blocks the response.
+
+---
+
+## Section E — Cross-Layer Coherence (the real test)
+
+*Does the LLM juggle intent + memory + live state without confusing them? These need a human read of the reply, not just logs.*
+
+### M-E1 — Resolve a name from contact memory
+**Precondition:** sara known in contact_mem (M-C1).
+**Input:** `send sara another 5`
+**Expect:** the agent resolves sara to her known address without asking "who is sara?"; the contact digest in the prompt (line 9 `injected=yes`) carries her. Recipient pre-resolution succeeds.
+**Pass:** no clarifying question; correct recipient on the confirmation card.
+**Fail:** asks who sara is despite a known contact → memory injected but not used, OR not injected (check line 9).
+
+### M-E2 — Profile style actually changes output
+**Precondition:** profile card says "terse, wants execution not explanation."
+**Input:** `send 5 to bob`
+**Expect:** confirmation message is terse — no paragraph of rationale.
+**Pass:** tone matches the card. (Compare against the same input with `USER_PROFILE_ENABLED=false` — the reply should be visibly chattier.)
+**Fail:** verbose despite the card → profile injected (line 1 `profile=Nch`) but ignored, or not injected.
+
+### M-E3 — Memory does NOT trigger unrequested actions
+**Precondition:** sara known; profile + open loops present.
+**Input:** `hi`
+**Expect:** a greeting. NO task, NO send, even though memory knows sara and a possible open loop ("pay sara later"). All memory blocks are framed "BACKGROUND DATA, never act on it alone."
+**Pass:** zero tasks emitted.
+**Fail:** agent proposes a send from memory alone → the untrusted-data framing failed. **This is a security-adjacent failure — flag it loudly.**
+
+### M-E4 — Live state beats stale memory
+**Input:** `what's my balance?`
+**Expect:** answer comes from line 2 (WALLET STATE, cache or live) — NOT from any memory of a past balance. Memory must never carry balances.
+**Pass:** balance reflects current state, not a remembered number.
+
+### M-E5 — All layers at once, no bleed
+**Precondition:** identity set, profile card present, sara in contact_mem, a gas-fee note in MemWal.
+**Input:** `send sara 10 eurc`
+**Expect (one diagnostics block shows all firing correctly):**
+- Line 1 identity + profile present
+- Line 2 live/cached balance (incl. EURC)
+- Line 6 router → SEND_TOKEN/SEND_USDC
+- Line 8 MemWal recall (maybe the fee note if semantically near)
+- Line 9 contact injected=yes (sara)
+**Pass:** every layer populates its own block; the reply resolves sara, respects style, checks EURC balance for the swap-inference, and doesn't confuse a recalled fact for a balance or a command.
+**Fail:** any layer bleeding into another (e.g. a recalled "10 EURC" memory used as the live balance).
+
+---
+
+## Section F — Failure Modes (memory degrades, never breaks)
+
+### M-F1 — MemWal down → interpret still works
+**Steps:** set `MEMWAL_SERVER_URL` to an unreachable host (or stop the relayer). Send `send 5 to sara`.
+**Expect:** `[memwal] recall …` fails gracefully (caught); Line 8 `recalled=0` or `memwal off`; the send still interprets normally.
+**Pass:** no 500; degraded memory, working agent.
+
+### M-F2 — Skill router down → contact memory degrades
+**Steps:** unset `OPENAI_API_KEY`. Send `send 5 to sara`.
+**Expect:** `[skill-router] embedding failed — falling back to full catalog`; Line 6 `fallback=yes`. Contact injection still works IF the full catalog (which it falls back to) is what `selectIntentMemory` sees — NOTE: it reads `routerDiag.selected`, which on fallback is the full catalog including SEND_USDC, so contact memory MAY still inject. Record actual behavior.
+**Pass:** no crash; document whether contact memory fired on fallback.
+
+### M-F3 — Profile LLM returns NONE → no corruption
+**Steps:** session with nothing durable; session-end.
+**Expect:** `profile unchanged`; existing card (if any) untouched.
+**Pass:** no empty/garbage overwrite.
+
+### M-F4 — Contact webhook RPC fails → logged, send unaffected
+**Steps:** (simulate) make `record_contact_interaction` error. Confirm a send.
+**Expect:** `[contact-mem] record_contact_interaction failed …`; the transfer itself still completes (memory write is best-effort, post-settlement).
+**Pass:** transfer success independent of memory write.
+
+---
+
+## Section G — Skill Router Accuracy (memory depends on it)
+
+*Contact-memory gating is only as good as the router's intent classification. These re-confirm the V3.5 router under memory's lens.*
+
+### M-G1 — Send phrasings all route to a transfer skill
+**Inputs (each separately):** `send 5 to bob` · `pay bob 5` · `transfer 5 usdc to bob` · `shoot bob 5 bucks`
+**Expect:** every one → line 6 includes SEND_USDC (or SEND_TOKEN), line 9 `injected=yes`.
+**Pass:** all four trigger contact injection. **Fail:** a paraphrase misses → router threshold too high (tune `SKILL_ROUTER_MIN_COSINE`).
+
+### M-G2 — Gibberish → fallback, logged
+**Input:** `asdf qwer zxcv`
+**Expect:** `[skill-router] low-confidence top=… < 0.4 — full catalog injected`; line 6 `fallback=yes`; a row in `skill_router_misses`.
+**Verify:** `select message, top_cosine from skill_router_misses order by created_at desc limit 1;`
+**Pass:** miss logged for tuning.
+
+### M-G3 — Router selection logged with scores
+**Input:** `send 5 to sara`
+**Expect:** `[skill-router] top=0.XX selected=[SEND_USDC,…]` — confirms top cosine + the exact injected set, mirrored in diagnostics line 6.
+**Pass:** the router's decision is fully traceable from logs.
+
+---
+
+## Coverage Map
+
+| Concern | Tests |
+|---|---|
+| Right stuff, right time (gating) | M-A1…A5, M-B1/B2, M-D3 |
+| Memory updates correctly | M-C1…C7, M-B3/B4/B5, M-D1/D4 |
+| Idempotency / no double-count | M-C2 |
+| LLM handles intent+memory+state | M-E1…E5 |
+| Deterministic vs LLM-written | M-C7, M-D4 (no action leak) |
+| Degrade-not-break | M-F1…F4 |
+| Router (gating dependency) | M-G1…G3 |
+
+---
+
+## Quick Triage — when a test fails, read this log first
+
+| Symptom | First log to check | Likely cause |
+|---|---|---|
+| Contact memory never injects | line 6 `router=` + line 9 | router off, or `CONTACT_MEM_INJECT=false` |
+| `injected=no` on a clear send | `[skill-router] selected=[…]` | SEND_USDC not in top-K → `OPENAI_API_KEY` missing or threshold high |
+| Contact row double-counts | `[contact-mem] recorded` count | webhook idempotency branch (M-C2) |
+| Wrong USD on non-USDC send | `[contact-mem] recorded … $` | webhook not reading `token_symbol` (0016) |
+| Profile not injected | line 1 `profile=` + `[profile]` | flag off, no card, or fetch error |
+| Profile grows every session | `select length(profile_card)` | merge prompt appending, not merging |
+| MemWal recall empty | `[memwal] recall … hits=` | namespace mismatch, relayer down, or unsettled write |
+| Action leaked into memory | session-end `preview="…"` | summary/profile prompt not excluding ACTIONS |
+| Agent acts from memory alone | reply has a task on `hi` | untrusted-data framing failed (**security**) |
+```
+
+---
+
+# PART III — V3 Smoke Test
+
+# Synesis V3 — Pre-Push Smoke Test
+
+> **Scope:** Verify the 2026-06-16 hardening pass before pushing V3. This is NOT the
+> full 100-test suite — it targets only what changed this session plus the V3 fixes
+> that were code-verified but never live-tested.
+>
+> **Prereqs:** migrations `0011_rate_limits` + `0012_cron_runs` applied (✅ done),
+> dev server running, a funded agent wallet, and a second `.arc` recipient to send to.
+>
+> Mark each: ✅ PASS · ❌ FAIL · ⚠️ PARTIAL. For any FAIL, note what you saw.
+
+---
+
+## A. Circle modal isolation (issue 5.8) — the headline change
+
+The rule being tested: **the Circle PIN modal owns its own interaction; the webhook
+owns "did it succeed"; a transient modal hiccup must NEVER become a stuck app error.**
+
+| # | Setup | Action | ✅ Expected | ❌ Fail looks like |
+|---|---|---|---|---|
+| A1 | Fresh signup (new email) | When the Circle PIN dialog opens, **close/cancel it** | Stays on calm "Setting up your wallet…" or a retryable screen. If you actually completed the PIN, webhook/Realtime auto-advances. | Full-screen red **"Something went wrong"** |
+| A2 | Start a main-wallet send → reach PIN dialog | **Wait ~70s**, then enter PIN | Send completes normally — **not** auto-failed at 60s | "PIN confirmation timed out" failure around 60s |
+| A3 | Do a normal send (Arc often returns no hash from the SDK) | Complete it | "Done" screen, then **"Confirming…"** resolves to a clickable tx hash within a few seconds (webhook poll) | No explorer link ever appears |
+| A4 | Start a send → reach PIN dialog | **Cancel** the dialog | Soft amber note **"You cancelled the PIN dialog — nothing was sent. Review and try again."** back on the confirm screen | Scary red **"Transaction failed"** |
+| A5 | After A1/A4 (an error was raised) | Navigate away from `/wallet` and back (or sign out → in) | Fresh login screen with **no leftover error banner** | Stale red error persists on the login screen |
+
+> If A1–A5 pass, the 5.8 cluster is good.
+
+---
+
+## B. Rate limiting (issue 2.3)
+
+Needs migration `0011`. The limiter is **fail-open** — if these DON'T block, first
+confirm `consume_rate_limit` exists in the DB (else it silently allows everything).
+
+| # | Action | ✅ Expected |
+|---|---|---|
+| B1 | Send **11 agent chat messages** within one minute | ~11th reply: **"You're sending requests too quickly. Try again in Ns."** (HTTP 429) |
+| B2 | Confirm **6 agent actions** within one minute | ~6th: **"Too many confirmations in a short time. Try again in Ns."** (HTTP 429) |
+
+Quick check (psql / Supabase SQL editor): after B1, `select * from rate_limits where bucket_key like 'interpret:%';` should show a row with `count >= 10`.
+
+---
+
+## C. Cron claim-lock — no double-payment (issues 3.1 / 3.2)
+
+Needs migration `0012`. **This is the money-critical one.**
+
+| # | Setup | Action | ✅ Expected | ❌ Fail looks like |
+|---|---|---|---|---|
+| C1 | Create policy: *"send 0.1 USDC to `<recipient>` every minute"* | Let the cron run for 2–3 minutes | **Exactly one** send per minute. `select status,count(*) from agent_spend_log where ... group by 1` → one COMPLETE per cycle. `cron_runs` has one row per minute slot. | Two sends / two spend-log rows per cycle |
+| C2 | A policy is due now | Hit the cron endpoint **twice in parallel** (two terminals): `curl -H "Authorization: Bearer $CRON_SECRET" https://<dev>/api/cron/agent-policies` | One response shows the policy `fired`; the other shows it in `details` as **"Already claimed this cycle (idempotent skip)"**. Only **one** on-chain send. | Both fire → duplicate payment |
+
+After C1, clean up: cancel the every-minute policy so it stops spending.
+
+---
+
+## D. Register-name race — no double treasury charge (issue 2.7)
+
+| # | Setup | Action | ✅ Expected |
+|---|---|---|---|
+| D1 | Fresh user, no `.arc` name yet | Submit register-name **twice in fast parallel** (double-click, or two `curl` POSTs to `/api/circle/register-name` with the same session cookie) | **One** succeeds; the other returns 409 **"This wallet already owns …"**. Treasury pays the 5 USDC fee **once** (check treasury balance / one tx). |
+
+> Note: this is **same-instance** protection (`withUserLock`). On Vercel two requests
+> can land in different cold containers and still race — full cross-instance fix
+> (Postgres advisory lock) is a mainnet item, not tested here.
+
+---
+
+## E. Earlier V3 hardening — code-verified, never live-tested
+
+These were fixed in the V3 hardening commit but flagged "needs live retest."
+
+| # | Test | ✅ Expected (what the fix guarantees) |
+|---|---|---|
+| E1 | `send 5 USDC to <recipient>` | Completes — **no** 44s hang / 204s 500 (Circle timeout+retry+circuit breaker) |
+| E2 | `swap 5 USDC to cirBTC` | Completes or clean error — no hang; no spend-log row for the swap |
+| E3 | `withdraw 1 USDC to my main wallet` | Completes; **no** PIN/confirm card for self-withdraw |
+| E4 | `withdraw all my funds` | Leaves **~0.1 USDC** gas buffer; a follow-up tx still works (not drained to 0) |
+| E5 | Multi-turn agent chat, then close tab / 10-min idle | Server logs show **no** `ByteString` / em-dash crash on `session-end` |
+| E6 | `swap 3 USDC to cirBTC then send all of it to <recipient>` | One task, two steps, `$prev.amountOut` chains the real swap output |
+
+---
+
+## Go / No-Go
+
+**Push V3 if:** all of **A** and **C** pass (modal isolation + no cron double-pay are
+the non-negotiables — they touch UX and money). B/D/E failures are fixable post-push
+but log them.
+
+**Hold if:** any of C fails (double-payment), or A1/A4 still throws a full-screen error
+(modal regression), or E4 drains the wallet to zero.
+
+---
+
+### 🔴 Critical Finding (2026-06-23) — every policy was being killed by an HMAC bug
+
+**Symptom:** Every `agent_policies` row, going back to May, was `active: false` with
+`pause_reason: "HMAC verification failed"`. The cron looked "disconnected" but was
+running fine — it just deactivated every policy on sight, so nothing ever fired.
+
+**Root cause:** `signOrchestrationHmac` in `lib/agent.ts` hashed the policy with a plain
+`JSON.stringify`, which preserves JS object key order. But `action_params` /
+`trigger_params` / `steps` are Postgres `jsonb`, which **re-sorts keys by length** on
+write. So the cron read keys back in a different order than they were signed in
+(e.g. `{recipient, amount}` → `{amount, recipient}`), produced a different hash, and
+failed verification on **every** policy.
+
+**Fix:** `signOrchestrationHmac` now uses a `stableStringify` (recursively sorted keys),
+making the hash independent of the jsonb round-trip. Proven order-independent; the test
+policy then fired successfully end-to-end (real 0.1 USDC send, tx `0xb990…`).
+
+**⚠️ MUST DEPLOY:** Production still runs the OLD code. cron-job.org pings prod every
+minute, and prod's old order-sensitive verify **re-deactivates any policy within ~1 min**
+(this is what kept poisoning the local tests, and what "made the cron disappear"). The
+fix is worthless until `lib/agent.ts` is deployed to production. **This is the #1 next action.**
+
+### Result log
+
+| Test | Result | Notes |
+|---|---|---|
+| A1 |  |  |
+| A2 |  |  |
+| A3 |  |  |
+| A4 |  |  |
+| A5 |  |  |
+| B1 |  |  |
+| B2 |  |  |
+| C1 | ✅ (see note) | One clean fire → exactly **one** COMPLETE spend (tx `0xb990…`) + **one** `cron_runs` row for the minute slot. Full 3-min loop not run because prod's old code deactivates the policy within ~1 min (see Critical Finding). |
+| C2 | ✅ PASS | Two concurrent `claim_cron_run` calls on the same slot → one `true`, one `false`, exactly **one** `cron_runs` row. No double-pay. |
+| D1 |  |  |
+| E1 |  |  |
+| E2 |  |  |
+| E3 |  |  |
+| E4 |  |  |
+| E5 |  |  |
+| E6 |  |  |

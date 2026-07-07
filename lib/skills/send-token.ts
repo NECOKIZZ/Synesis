@@ -190,7 +190,8 @@ export const SendToken: SkillHandler = {
         skill:              "SEND_TOKEN",
         recipient_address:  recipientAddress,
         recipient_arc_name: recipient.startsWith("0x") ? null : normalizeName(recipient),
-        amount_usdc:        amountUsd,   // USDC-equivalent for limit accounting
+        amount_usdc:        amountUsd,    // USDC-equivalent for limit accounting
+        token_symbol:       tokenSymbol,  // actual token moved (EURC / cirBTC / …)
         status:             "PENDING",
       })
       .select("id")

@@ -5,10 +5,14 @@
   "description": "DotArc Smart Wallet — USDC-native wallet where your identity is your .arc name. Standalone Next.js app, deploys to wallet.dotarc.app.",
   "scripts": {
     "dev": "next dev",
+    "prebuild": "npm run check:skills",
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
+    "check:skills": "npx tsx --conditions=react-server scripts/check-skill-sync.ts",
+    "seed:skills": "npx tsx --conditions=react-server --env-file=.env.local scripts/seed-skill-embeddings.ts",
+    "solana:smoke": "npx tsx --conditions=react-server --env-file=.env.local scripts/solana-smoke.ts",
     "circle:generate-secret": "node scripts/generate-secret.mjs",
     "circle:register-secret": "node --env-file=.env.local scripts/register-secret.mjs",
     "circle:create-treasury": "node --env-file=.env.local scripts/create-treasury.mjs",
@@ -23,6 +27,8 @@
     "@circle-fin/w3s-pw-web-sdk": "^1.1.0",
     "@hashpaylink/sdk": "^1.0.0",
     "@mysten-incubation/memwal": "^0.0.7",
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.98.4",
     "@supabase/ssr": "^0.10.3",
     "@supabase/supabase-js": "^2.106.0",
     "bcryptjs": "^2.4.3",
@@ -35,6 +41,7 @@
     "qrcode": "^1.5.4",
     "react": "19.0.0",
     "react-dom": "19.0.0",
+    "server-only": "^0.0.1",
     "three": "^0.184.0"
   },
   "devDependencies": {
@@ -48,6 +55,7 @@
     "eslint": "^9",
     "eslint-config-next": "15.2.0",
     "postcss": "^8.4.49",
+    "supabase": "^2.108.0",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.7.0"
   }

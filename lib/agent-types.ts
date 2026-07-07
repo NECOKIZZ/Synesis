@@ -1,5 +1,5 @@
 /**
- * DotArc Smart Agent — shared types (no server-only).
+ * Synesis Smart Agent — shared types (no server-only).
  *
  * These types are used by both server-side agent logic and client-side UI.
  * They contain no runtime code and can be safely imported into "use client"
@@ -20,6 +20,8 @@ export type SkillName =
   | "SEND_TOKEN"
   | "GET_PRICE"
   | "IKNOW"
+  | "RETRIEVE_TRANSACTIONS"
+  | "SEND_SOLANA_USDC"
   | "UNKNOWN";
 
 export type LeafSkill = Exclude<SkillName, "CREATE_POLICY" | "UNKNOWN">;
@@ -153,5 +155,20 @@ export type InterpretResult = {
    * absent, the UI MUST default to true (fail-safe).
    */
   requires_pin?: boolean;
+  /**
+   * Server-computed — total USDC drawn UP FRONT across every "now" task
+   * (the requiresBalanceCheck skills only: SEND_USDC / WITHDRAW / BRIDGE).
+   * The client uses THIS for its pre-PIN insufficient-balance fast-fail
+   * instead of re-summing step amounts (which mis-counted config caps — F-7).
+   * Absent → treat as 0.
+   */
+  upfront_usdc?: number;
+  /**
+   * Server-computed — true when the batch needs no PIN and can execute
+   * immediately without a confirm card (reads, config, same-user money
+   * moves). Replaces the client's hardcoded read-only allowlist (F-8).
+   * Absent → treat as false (fail-safe: show the card).
+   */
+  auto_confirm?: boolean;
 };
 

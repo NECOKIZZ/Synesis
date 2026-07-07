@@ -25,7 +25,12 @@ function asChain(s: string): SwapChain { return s as SwapChain; }
 
 // Arc Testnet supports USDC, EURC, and cirBTC only.
 // Other chains support a broader token set — extend this list if needed.
-const SUPPORTED_TOKENS = ["USDC", "EURC", "cirBTC"] as const;
+// CANONICAL FORM IS UPPERCASE: tokenIn/tokenOut are uppercased before the
+// membership check below, so every entry here MUST be uppercase — a mixed-case
+// entry (the old "cirBTC") silently fails `.includes("CIRBTC")` and reports a
+// valid token as "unsupported". `SUPPORTED_TOKENS_DISPLAY` is the user-facing form.
+const SUPPORTED_TOKENS = ["USDC", "EURC", "CIRBTC"] as const;
+const SUPPORTED_TOKENS_DISPLAY = "USDC, EURC, cirBTC";
 
 export const SwapUsdc: SkillHandler = {
   category: "TRANSFER",
@@ -55,10 +60,10 @@ export const SwapUsdc: SkillHandler = {
       return { ok: false, error: "tokenIn and tokenOut are required. On Arc Testnet: USDC, EURC, cirBTC", status: 400 };
     }
     if (!SUPPORTED_TOKENS.includes(tokenIn as typeof SUPPORTED_TOKENS[number])) {
-      return { ok: false, error: `Unsupported tokenIn: ${tokenIn}. Arc Testnet supports: ${SUPPORTED_TOKENS.join(", ")}`, status: 400 };
+      return { ok: false, error: `Unsupported tokenIn: ${tokenIn}. Arc Testnet supports: ${SUPPORTED_TOKENS_DISPLAY}`, status: 400 };
     }
     if (!SUPPORTED_TOKENS.includes(tokenOut as typeof SUPPORTED_TOKENS[number])) {
-      return { ok: false, error: `Unsupported tokenOut: ${tokenOut}. Arc Testnet supports: ${SUPPORTED_TOKENS.join(", ")}`, status: 400 };
+      return { ok: false, error: `Unsupported tokenOut: ${tokenOut}. Arc Testnet supports: ${SUPPORTED_TOKENS_DISPLAY}`, status: 400 };
     }
     if (tokenIn === tokenOut) {
       return { ok: false, error: "tokenIn and tokenOut must be different", status: 400 };
@@ -78,6 +83,20 @@ export const SwapUsdc: SkillHandler = {
       CIRBTC: { address: null, decimals: 8 },
     };
     const tokenInInfo = TOKEN_INFO[tokenIn];
+    const tokenOutInfo = TOKEN_INFO[tokenOut];
+    // cirBTC has no contract address on Arc testnet yet (KI 1.1), so any swap
+    // touching it cannot execute. Now that the casing fix lets "CIRBTC" pass
+    // the support check, fail here with an honest message instead of letting
+    // App Kit throw an opaque error downstream.
+    if (tokenInInfo?.address === null || tokenOutInfo?.address === null) {
+      const missing = tokenInInfo?.address === null ? tokenIn : tokenOut;
+      const display = missing === "CIRBTC" ? "cirBTC" : missing;
+      return {
+        ok: false,
+        error: `Swaps involving ${display} aren't available yet — it has no contract address on Arc testnet.`,
+        status: 400,
+      };
+    }
     let currentBalance: number;
     try {
       if (tokenInInfo?.address) {

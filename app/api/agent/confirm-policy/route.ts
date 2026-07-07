@@ -18,7 +18,7 @@
  * The caller receives a result entry per task with ok/error, in order.
  *
  * Layered security (unchanged):
- *   L1 — DotArc JWT session
+ *   L1 — Synesis JWT session
  *   L2 — Agent wallet ownership
  *   L3 — Agent PIN + lockout
  *   L4 — Per-user serialization (withUserLock) for fund-affecting batches
@@ -34,10 +34,10 @@ import { claimIdempotency, finalizeIdempotency } from "@/lib/agent-idempotency";
 import { logSkillExecution } from "@/lib/agent-audit";
 import { withUserLock } from "@/lib/agent-lock";
 import { skillRegistry } from "@/lib/skills";
-import { batchRequiresPin } from "@/lib/skills/pin-policy";
+import { batchRequiresPin, totalUpfrontUsdc } from "@/lib/skills/pin-policy";
+import { toAppError } from "@/lib/errors";
 import type { SkillContext } from "@/lib/skills";
 import { resolveRecipient } from "@/lib/ans";
-import { recordSendHabit } from "@/lib/memory";
 import { checkRateLimit } from "@/lib/rate-limit";
 import type { Task, PlanStep } from "@/lib/agent-types";
 import crypto from "node:crypto";
@@ -121,47 +121,10 @@ function validateTasksShape(
 }
 
 // ── Pre-flight helpers ────────────────────────────────────────────────
-
-function extractAmountFromParams(params: Record<string, unknown>): number {
-  if (params.amount === "all") return 0;
-  const raw = Number(params.amount ?? 0);
-  if (!Number.isFinite(raw) || raw <= 0) return 0;
-  return raw;
-}
-
-/**
- * USDC requirement for a sequence of steps. Mirrors the amount-tracking
- * rules in lib/skills/create-policy.ts so pre-flight numbers match
- * what the cron / executor will actually enforce.
- */
-function extractPlanAmount(steps: PlanStep[]): number {
-  return steps.reduce((total, step) => {
-    // Only skills that draw USDC out of the agent wallet up front gate on
-    // balance. Each such skill declares requiresBalanceCheck=true and its
-    // `params.amount` is denominated in USDC (SEND_USDC, WITHDRAW,
-    // BRIDGE_USDC). Everything else — SET_LIMIT, GET_PRICE, IKNOW,
-    // LIST_POLICIES, CREATE_POLICY, SEND_TOKEN (non-USDC unit), SWAP_USDC
-    // (checked in-skill) — leaves the flag false so its numeric params are
-    // never mistaken for an upfront USDC spend.
-    const handler = skillRegistry[step.skill];
-    if (!handler?.requiresBalanceCheck) return total;
-    const raw = step.params.amount;
-    if (typeof raw === "string" && raw.startsWith("$prev")) return total;
-    return total + extractAmountFromParams(step.params);
-  }, 0);
-}
-
-/**
- * Sum of upfront USDC required across every "now" task's steps. Policy
- * tasks (non-"now" triggers) don't draw funds at creation — the cron
- * does that later — so we exclude them here.
- */
-function totalUpfrontUsdc(tasks: Task[]): number {
-  return tasks.reduce((acc, t) => {
-    if (t.trigger.type !== "now") return acc;
-    return acc + extractPlanAmount(t.steps);
-  }, 0);
-}
+//
+// `totalUpfrontUsdc` now lives in the shared gating SSOT (lib/skills/pin-policy.ts)
+// so interpret and confirm-policy compute the pre-flight number identically —
+// no drift between what the UI fast-fails on and what the server enforces (D2).
 
 /**
  * Collect every recipient identifier across all "now" tasks' SEND_USDC
@@ -233,6 +196,7 @@ async function executePlan(
   baseCtx: SkillContext,
   serviceSupabase: ReturnType<typeof createSupabaseServiceClient>,
   userId: string,
+  traceId: string,
 ): Promise<PlanRunResult> {
   const stepResults: StepResult[] = [];
   let prevResult: Record<string, unknown> = {};
@@ -255,6 +219,27 @@ async function executePlan(
     const stepCtx: SkillContext = { ...baseCtx, params: resolvedParams };
     const t0 = Date.now();
     const output = await handler.execute(stepCtx);
+    const stepMs = Date.now() - t0;
+
+    // Single chokepoint that logs EVERY skill outcome — including the gate
+    // rejections (balance / spend-limit / resolve / self-send) that the
+    // individual skills return silently. Gives the console a full picture of
+    // the money path without instrumenting each skill file.
+    {
+      const p = resolvedParams;
+      const parts = [
+        p.amount !== undefined ? `amount=${JSON.stringify(p.amount)}` : "",
+        p.token !== undefined ? `token=${JSON.stringify(p.token)}` : "",
+        p.recipient !== undefined ? `recipient=${JSON.stringify(p.recipient)}` : "",
+        p.chain !== undefined ? `chain=${JSON.stringify(p.chain)}` : "",
+      ].filter(Boolean).join(" ");
+      console.log(
+        `[agent/confirm] trace=${traceId} step=${i + 1}/${steps.length} skill=${step.skill}` +
+          `${parts ? " " + parts : ""} ok=${output.ok}` +
+          `${output.ok ? "" : ` status=${output.status ?? "?"} error=${JSON.stringify(output.error)}`}` +
+          ` duration=${stepMs}ms`,
+      );
+    }
 
     await logSkillExecution({
       service: serviceSupabase,
@@ -332,6 +317,9 @@ async function dispatchTask(args: {
       key: idemKey,
       ttlSeconds: idemTtl,
     });
+    console.log(
+      `[agent/confirm] trace=${traceId} task=${taskIndex} idempotency=${claim.kind} skill=${auditSkill}`,
+    );
     if (claim.kind === "replay") {
       await logSkillExecution({
         service: serviceSupabase,
@@ -381,7 +369,7 @@ async function dispatchTask(args: {
   // ── Run-now path ─────────────────────────────────────────────────
   if (isNow) {
     const t0 = Date.now();
-    const planResult = await executePlan(task.steps, baseCtx, serviceSupabase, userId);
+    const planResult = await executePlan(task.steps, baseCtx, serviceSupabase, userId, traceId);
     const durationMs = Date.now() - t0;
     const httpStatus = planResult.ok ? 200 : 400;
     console.log(
@@ -479,67 +467,12 @@ async function dispatchTask(args: {
   return { ok: true, kind: "policy", task_index: taskIndex, result: output.result };
 }
 
-// ── Memory: record send habits (Layer B) ─────────────────────────────
-
-/**
- * After a batch runs, persist "who the user pays" facts for completed
- * SEND_USDC / SEND_TOKEN steps. Best-effort and fully isolated: any
- * failure is swallowed so it can never affect the user's response.
- *
- * Pulls the recipient address from the skill's RESULT (authoritative,
- * post-resolution) and the arc name from the original step params.
- */
-async function recordSendHabits(
-  service: ReturnType<typeof createSupabaseServiceClient>,
-  userId: string,
-  tasks: Task[],
-  results: TaskResult[],
-): Promise<void> {
-  const writes: Array<Promise<unknown>> = [];
-
-  for (const r of results) {
-    if (!r.ok || r.kind !== "executed") continue;
-    const task = tasks[r.task_index];
-    if (!task) continue;
-
-    // (step, output) pairs: single-step uses r.result; multi-step uses r.steps.
-    const pairs: Array<{ step: PlanStep; out: Record<string, unknown> }> = [];
-    if (task.steps.length === 1 && isPlainObject(r.result)) {
-      pairs.push({ step: task.steps[0], out: r.result });
-    } else if (r.steps) {
-      r.steps.forEach((s, idx) => {
-        if (s.ok && isPlainObject(s.result) && task.steps[idx]) {
-          pairs.push({ step: task.steps[idx], out: s.result });
-        }
-      });
-    }
-
-    for (const { step, out } of pairs) {
-      if (step.skill !== "SEND_USDC" && step.skill !== "SEND_TOKEN") continue;
-      const address = String(out.recipientAddress ?? "").trim();
-      if (!address) continue;
-      const rawRecipient = typeof step.params.recipient === "string" ? step.params.recipient : "";
-      const arcName = rawRecipient && !rawRecipient.startsWith("0x") ? rawRecipient : undefined;
-      const token = step.skill === "SEND_USDC" ? "USDC" : String(out.token ?? step.params.token ?? "").toUpperCase() || undefined;
-      const amountUsdc = step.skill === "SEND_USDC" ? Number(out.amountUsdc ?? step.params.amount) || undefined : undefined;
-      writes.push(recordSendHabit(service, userId, { address, arcName, token, amountUsdc }));
-    }
-  }
-
-  if (writes.length === 0) return;
-  try {
-    await Promise.allSettled(writes);
-  } catch {
-    // never throws — recordSendHabit already swallows its own errors
-  }
-}
-
 // ── Route handler ─────────────────────────────────────────────────────
 
 export async function POST(req: Request) {
   const traceId = crypto.randomUUID();
 
-  // L1: DotArc JWT session
+  // L1: Synesis JWT session
   let agentSession: Awaited<ReturnType<typeof requireAgentSession>>;
   try {
     agentSession = await requireAgentSession();
@@ -596,17 +529,26 @@ export async function POST(req: Request) {
 
   const supabase = await createSupabaseServerClient();
 
-  // L2: agent wallet ownership
-  const { data: agentWallet } = await supabase
+  // L2: agent wallet ownership. A user may hold multiple wallets (one per
+  // blockchain), so load all rows and split by chain rather than maybeSingle().
+  const { data: agentWalletRows } = await supabase
     .from("agent_wallets")
-    .select("circle_wallet_id, circle_wallet_address, balance_cache_usdc, balance_cache_at")
-    .eq("user_id", supabaseUserId)
-    .maybeSingle();
+    .select("circle_wallet_id, circle_wallet_address, blockchain, balance_cache_usdc, balance_cache_at")
+    .eq("user_id", supabaseUserId);
 
-  if (!agentWallet) {
+  const evmWallet = (agentWalletRows ?? []).find(
+    (w) => (w.blockchain ?? "ARC-TESTNET") === "ARC-TESTNET",
+  );
+  if (!evmWallet) {
     return NextResponse.json({ error: "Agent wallet not activated" }, { status: 400 });
   }
-  const wallet = agentWallet;
+  // Assign to a fresh const AFTER the guard so the non-undefined narrowing is
+  // baked into the type and survives into the runBatch() closure below.
+  const wallet = evmWallet;
+  // Present only once the user has activated Solana. Solana skills read this
+  // and fail clearly when it's null.
+  const solanaWallet =
+    (agentWalletRows ?? []).find((w) => w.blockchain === "SOL-DEVNET") ?? null;
 
   // ── Pre-flight: cached balance check across the batch ────────────
   const upfrontUsdc = totalUpfrontUsdc(tasks);
@@ -630,9 +572,15 @@ export async function POST(req: Request) {
     try {
       await resolveRecipient(r);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : `Could not resolve: ${r}`;
-      console.warn(`[agent/confirm] trace=${traceId} preflight_resolve_fail "${r}" msg="${msg}"`);
-      return NextResponse.json({ error: msg }, { status: 400 });
+      const appErr = toAppError(err);
+      const msg = appErr.message || `Could not resolve: ${r}`;
+      console.warn(
+        `[agent/confirm] trace=${traceId} preflight_resolve_fail "${r}" code=${appErr.code} retryable=${appErr.retryable} msg="${msg}"`,
+      );
+      // A transient ANS/RPC failure (F-17) isn't the user's fault — signal it as
+      // retryable (503) with a "try again" message, not a terminal 400 "bad
+      // recipient". A genuine RECIPIENT_NOT_FOUND stays a 400.
+      return NextResponse.json({ error: msg }, { status: appErr.retryable ? 503 : 400 });
     }
   }
 
@@ -654,6 +602,10 @@ export async function POST(req: Request) {
   }
 
   const affectsFunds = batchAffectsFunds(tasks);
+  console.log(
+    `[agent/confirm] trace=${traceId} plan needsPin=${needsPin} affectsFunds=${affectsFunds} ` +
+      `upfrontUsdc=${upfrontUsdc} solana=${solanaWallet ? "yes" : "no"} lock=${affectsFunds ? "on" : "off"}`,
+  );
   return affectsFunds
     ? withUserLock(supabaseUserId, () => runBatch())
     : runBatch();
@@ -674,6 +626,9 @@ export async function POST(req: Request) {
             : "Couldn't reach Circle to confirm your balance. No money has moved — please try again in a moment.";
         return NextResponse.json({ error: msg }, { status: 503 });
       }
+      console.log(
+        `[agent/confirm] trace=${traceId} live_balance source=live balance=${balance} need=${upfrontUsdc}`,
+      );
       if (balance < upfrontUsdc) {
         return NextResponse.json(
           {
@@ -716,6 +671,7 @@ export async function POST(req: Request) {
       supabaseUserId,
       mainWalletAddress: session.walletAddress,
       agentWallet: wallet,
+      agentSolanaWallet: solanaWallet,
       limits,
       params: {}, // per-task params injected inside dispatchTask
       getSpentSince,
@@ -739,8 +695,10 @@ export async function POST(req: Request) {
       // sees per-task outcomes in the response.
     }
 
-    // Layer B memory: record who the user paid (best-effort, non-fatal).
-    await recordSendHabits(serviceSupabase, supabaseUserId, tasks, results);
+    // Contact memory is recorded from the Circle webhook on confirmed
+    // transfers (lib/memory/contact-mem.ts via app/api/webhooks/circle),
+    // so there is nothing to persist here — the executor stays out of the
+    // memory path entirely.
 
     const successCount = results.filter((r) => r.ok).length;
     const httpStatus = successCount === tasks.length ? 200 : successCount === 0 ? 400 : 207;

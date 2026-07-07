@@ -1,7 +1,7 @@
 /**
  * lib/skills/types.ts
  *
- * Shared contract for every DotArc agent skill.
+ * Shared contract for every Synesis agent skill.
  *
  * Rules:
  *  - Skill files MUST NOT import from each other.
@@ -37,6 +37,9 @@ export type SpendLimits = {
 export type AgentWallet = {
   circle_wallet_id: string;
   circle_wallet_address: string;
+  // Circle blockchain identifier (ARC-TESTNET | SOL-DEVNET | …). Lets a skill
+  // confirm which chain a wallet belongs to. Optional for backward compat.
+  blockchain?: string;
   // Optional cache fields — populated by confirm-policy when present in
   // agent_wallets. Skills MAY use these for short-window dedupe or stale
   // fallback when Circle is unreachable.
@@ -59,7 +62,11 @@ export type SkillContext = {
   serviceSupabase: SupabaseClient;
   supabaseUserId: string;
   mainWalletAddress: string;     // user's main wallet address, from verified JWT session
-  agentWallet: AgentWallet;
+  agentWallet: AgentWallet;      // the EVM (ARC-TESTNET) agent wallet
+  // The agent's Solana (SOL-DEVNET) wallet, present only once the user has
+  // activated Solana (POST /api/agent/activate-solana). Solana skills read
+  // this and fail clearly when it's null. Separate base58 address.
+  agentSolanaWallet?: AgentWallet | null;
   limits: SpendLimits;
   params: Record<string, unknown>;
   getSpentSince: (since: Date) => Promise<number>; // sum of COMPLETE spend log entries

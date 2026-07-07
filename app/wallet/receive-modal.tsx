@@ -30,10 +30,10 @@ export function ReceiveModal({ walletAddress, arcName, onClose }: ReceiveModalPr
     if (navigator.share) {
       try {
         await navigator.share({
-          title: arcName ? `Pay ${arcName}` : "Pay me on DotArc",
+          title: arcName ? `Pay ${arcName}` : "Pay me on Synesis",
           text: arcName
             ? `Send USDC to ${arcName} on Arc Testnet`
-            : `Send USDC to my DotArc wallet`,
+            : `Send USDC to my Synesis wallet`,
           url: shareUrl,
         });
         return;

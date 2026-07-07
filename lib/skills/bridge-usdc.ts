@@ -22,6 +22,7 @@ import { AppKit } from "@circle-fin/app-kit";
 import { getCircleAdapter } from "@/lib/circleAdapter";
 import { checkBalanceSufficient, checkSpendLimits, startOfDayUTC, startOfWeekUTC, startOfMonthUTC } from "@/lib/agent";
 import { normalizeName } from "@/lib/ans";
+import { normalizeBridgeChain, SUPPORTED_BRIDGE_CHAINS } from "./chains";
 import type { SkillHandler, SkillContext, SkillOutput } from "./types";
 
 type BridgeChain = Parameters<InstanceType<typeof AppKit>["bridge"]>[0]["from"]["chain"];
@@ -57,25 +58,51 @@ export const BridgeUsdc: SkillHandler = {
       agentWallet, mainWalletAddress, limits, params, getSpentSince,
     } = ctx;
 
-    const rawAmount = Number(params.amount);
-    const fromChain = String(params.fromChain ?? "Arc_Testnet");
-    const toChain   = String(params.toChain   ?? "").trim();
-    const toAddress = String(params.toAddress ?? mainWalletAddress).trim() || mainWalletAddress;
+    const rawAmount    = Number(params.amount);
+    const fromChainRaw = String(params.fromChain ?? "Arc_Testnet");
+    const toChainRaw   = String(params.toChain   ?? "").trim();
+    const toAddress    = String(params.toAddress ?? mainWalletAddress).trim() || mainWalletAddress;
 
-    if (!toChain) {
-      return { ok: false, error: "toChain is required (e.g. Base, Ethereum, Polygon, Base_Sepolia)", status: 400 };
+    if (!toChainRaw) {
+      return { ok: false, error: "toChain is required (e.g. Base, Ethereum, Arbitrum)", status: 400 };
     }
     if (isNaN(rawAmount) || rawAmount <= 0) {
       return { ok: false, error: "amount must be a positive number", status: 400 };
-    }
-    if (fromChain === toChain) {
-      return { ok: false, error: "fromChain and toChain must be different", status: 400 };
     }
     if (toAddress.startsWith("0x") && !isAddress(toAddress)) {
       return { ok: false, error: "toAddress is not a valid EVM address", status: 400 };
     }
 
+    // Normalize free-form chain names ("base", "Arbitrum") → the exact App Kit
+    // Blockchain enum the SDK requires. Fail fast on anything unrecognised.
+    const fromChain = normalizeBridgeChain(fromChainRaw);
+    const toChain   = normalizeBridgeChain(toChainRaw);
+    if (!fromChain || !toChain) {
+      const bad = !toChain ? toChainRaw : fromChainRaw;
+      return {
+        ok: false,
+        status: 400,
+        error: `Unsupported chain "${bad}". Supported: ${SUPPORTED_BRIDGE_CHAINS.join(", ")}.`,
+      };
+    }
+    if (fromChain === toChain) {
+      return { ok: false, error: "fromChain and toChain must be different", status: 400 };
+    }
+
     const amount = parseFloat(rawAmount.toFixed(6));
+
+    // Arc's CCTP fast-transfer max fee is ~1.4 USDC and MUST be smaller than
+    // the bridged amount, or the burn step reverts with
+    // "Max fee must be less than amount". Reject sub-fee amounts up front so
+    // the user gets a clear message instead of a cryptic on-chain revert.
+    const arcMinBridge = Number(process.env.ARC_MIN_BRIDGE_USDC ?? "2");
+    if (fromChain === "Arc_Testnet" && amount < arcMinBridge) {
+      return {
+        ok: false,
+        status: 400,
+        error: `Bridging from Arc needs at least ${arcMinBridge} USDC — the CCTP fast-transfer fee (~1.4 USDC) must be smaller than the amount. Try a larger amount.`,
+      };
+    }
 
     const balanceCheck = await checkBalanceSufficient(agentWallet.circle_wallet_id, amount);
     if (!balanceCheck.sufficient) {
@@ -134,28 +161,54 @@ export const BridgeUsdc: SkillHandler = {
       const kit     = new AppKit();
       const adapter = getCircleAdapter();
 
-      const result = await kit.bridge({
+      // Custodial / forwarder mode: the agent has no signer on the destination
+      // chain, so we OMIT the destination adapter and pass recipientAddress +
+      // useForwarder. Circle's Orbit relayer fetches the attestation and
+      // submits the mint. maxFee is pinned because Arc's default fast-transfer
+      // fee floor can otherwise revert the burn ("Max fee must be less than
+      // amount").
+      let result = await kit.bridge({
         from: {
           adapter,
           chain: asChain(fromChain),
           address: agentWallet.circle_wallet_address,
         },
         to: {
-          adapter,
+          recipientAddress: toAddress,
           chain: asChain(toChain),
-          address: toAddress,
           useForwarder: true,
         },
         amount: amount.toFixed(6),
+        config: {
+          transferSpeed: "FAST",
+          maxFee: process.env.BRIDGE_MAX_FEE ?? "1.50",
+        },
       });
 
-      const steps = result.steps as Array<{ name: string; state: string; txHash?: string; explorerUrl?: string; error?: string }>;
-      const burnStep = steps?.find((s) => s.name === "burn");
-      const mintStep = steps?.find((s) => s.name === "mint");
-      const failedStep = steps?.find((s) => s.state === "error");
+      // Soft errors (attestation timeout, RPC blip) are common on testnet and
+      // recoverable. Retry once before giving up. Forwarder-only destination →
+      // omit `to` in the retry context (Circle's relayer handles the mint).
+      if (result.state === "error") {
+        const firstErr = (result.steps as Array<{ state: string; error?: string }> | undefined)
+          ?.find((s) => s.state === "error")?.error;
+        console.warn("[bridge-usdc] soft error, retrying once:", firstErr);
+        try {
+          result = await kit.retryBridge(result, { from: adapter });
+        } catch (retryErr) {
+          console.warn("[bridge-usdc] retry threw:", retryErr instanceof Error ? retryErr.message : retryErr);
+        }
+      }
 
-      console.log("[bridge-usdc] state:", result.state, "burn:", burnStep?.txHash);
+      const steps = (result.steps ?? []) as Array<{ name: string; state: string; txHash?: string; explorerUrl?: string; error?: string }>;
+      const burnStep   = steps.find((s) => s.name === "burn");
+      const mintStep   = steps.find((s) => s.name === "mint");
+      const failedStep = steps.find((s) => s.state === "error");
 
+      console.log("[bridge-usdc] state:", result.state, "burn:", burnStep?.txHash, "(forwarded)");
+
+      // Success is keyed off result.state ONLY. Under the forwarder the mint is
+      // submitted by Circle's relayer, so mintStep.txHash is undefined even on
+      // a fully successful bridge — never gate success on it.
       if (result.state !== "success") {
         if (logRowId) {
           await serviceSupabase.from("agent_spend_log").update({ status: "FAILED", error_message: failedStep?.error ?? "unknown" }).eq("id", logRowId);
@@ -175,12 +228,13 @@ export const BridgeUsdc: SkillHandler = {
         ok: true,
         result: {
           amount:       result.amount,
-          fromChain:    (result.source as { chain?: { chain?: string } })?.chain?.chain ?? fromChain,
-          toChain:      (result.destination as { chain?: { chain?: string } })?.chain?.chain ?? toChain,
+          fromChain,
+          toChain,
           toAddress,
           burnTxHash:   burnStep?.txHash   ?? null,
-          mintTxHash:   mintStep?.txHash   ?? null,
+          mintTxHash:   mintStep?.txHash   ?? null,   // null under forwarder — expected
           explorerUrl:  burnStep?.explorerUrl ?? null,
+          forwarded:    true,
         },
       };
     } catch (err) {

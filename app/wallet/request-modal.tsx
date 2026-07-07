@@ -23,7 +23,7 @@ export function RequestModal({ walletAddress, arcName, onClose }: RequestModalPr
     params.set("e", walletAddress);
     params.set("n", "arc");
     params.set("a", amount || "0");
-    const m = memo.trim() || (arcName ? `Payment to ${arcName.split(".")[0]}.arc on DotArc` : "Payment request");
+    const m = memo.trim() || (arcName ? `Payment to ${arcName.split(".")[0]}.arc on Synesis` : "Payment request");
     params.set("m", m);
     return `https://hashpaylink.com/pay?${params.toString()}`;
   }, [walletAddress, amount, memo, arcName]);
@@ -44,7 +44,7 @@ export function RequestModal({ walletAddress, arcName, onClose }: RequestModalPr
   const share = useCallback(async () => {
     if (!hasAmount) return;
     const name = arcName ? arcName.split(".")[0] : "me";
-    const title = `Pay ${name}.arc on DotArc`;
+    const title = `Pay ${name}.arc on Synesis`;
     const text = `Send ${amount} USDC to ${name}.arc on Arc Testnet`;
 
     if (navigator.share) {

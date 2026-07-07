@@ -1,5 +1,5 @@
 /**
- * DotArc Agent Memory — Layer C: Walrus Memory adapter.
+ * Synesis Agent Memory — Layer C: Walrus Memory adapter.
  *
  * Hard isolation rules (do not break these):
  *   1. NO other file in the repo imports `@mysten-incubation/memwal`.
@@ -28,6 +28,7 @@
  */
 
 import "server-only";
+import { recordMemOk, recordMemFail } from "./mem-health";
 
 // ── Env gates ─────────────────────────────────────────────────────────
 
@@ -144,12 +145,24 @@ export async function walrusRemember(userId: string, text: string): Promise<bool
     const job = await client.remember(fact);
     // Intentionally NOT awaited — relayer takes ~seconds to settle.
     if (job?.job_id) {
-      void client.waitForRememberJob(job.job_id).catch((err) => {
-        console.warn(`[walrus] background job ${job.job_id} failed:`, err instanceof Error ? err.message : String(err));
-      });
+      console.log(
+        `[memwal] remember accepted job=${job.job_id} chars=${fact.length} preview="${fact.slice(0, 90).replace(/\s+/g, " ")}"`,
+      );
+      void client.waitForRememberJob(job.job_id)
+        .then(() => {
+          recordMemOk("memwal");
+          console.log(`[memwal] remember settled job=${job.job_id}`);
+        })
+        .catch((err) => {
+          // The write was accepted but never SETTLED — count it as a fail so a
+          // relayer that silently drops jobs is visible in diagnostics (D4).
+          recordMemFail("memwal", err);
+          console.warn(`[walrus] background job ${job.job_id} failed:`, err instanceof Error ? err.message : String(err));
+        });
     }
     return true;
   } catch (err) {
+    recordMemFail("memwal", err);
     console.warn("[walrus] remember failed:", err instanceof Error ? err.message : String(err));
     return false;
   }
@@ -176,10 +189,20 @@ export async function walrusRecall(
     if (!client) return [];
     const result = await client.recall({ query: q, limit });
     const items = result?.results ?? [];
-    return items
+    const texts = items
       .map((r) => (typeof r?.text === "string" ? r.text.trim() : ""))
       .filter((s) => s.length > 0)
       .slice(0, limit);
+    // Diagnostics: what the semantic recall actually returned and how
+    // confident it was — so a bad/empty recall is visible, not silent.
+    const scores = items
+      .slice(0, limit)
+      .map((r) => (typeof r?.score === "number" ? r.score.toFixed(3) : "?"))
+      .join(",");
+    console.log(
+      `[memwal] recall q="${q.slice(0, 60).replace(/\s+/g, " ")}" hits=${texts.length}/${limit} scores=[${scores}]`,
+    );
+    return texts;
   } catch (err) {
     console.warn("[walrus] recall failed:", err instanceof Error ? err.message : String(err));
     return [];

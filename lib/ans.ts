@@ -7,6 +7,8 @@
 
 import "server-only";
 import { Contract, JsonRpcProvider } from "ethers";
+import { AppError } from "./errors";
+import { withResilience } from "./resilience";
 
 const RPC_URL =
   process.env.NEXT_PUBLIC_ARC_RPC_URL || "https://rpc.testnet.arc.network";
@@ -58,8 +60,45 @@ export async function reverseLookup(address: string): Promise<string | null> {
 }
 
 /**
+ * Distinguish a TRANSIENT RPC/transport failure (node unreachable, timeout,
+ * connection reset) from a definitive contract-level answer. This is the crux
+ * of F-17: `resolveName` above catches every error and returns null, so a
+ * network blip looked identical to "this name has no owner" — and the user was
+ * told a perfectly valid recipient "is not registered". A transient failure
+ * must be retryable and phrased as "couldn't verify, try again", never terminal.
+ */
+export function isTransientRpcError(err: unknown): boolean {
+  const e = err as {
+    code?: string;
+    message?: string;
+    error?: { code?: string };
+    cause?: { code?: string };
+  };
+  const ethersCode = String(e?.code ?? "").toUpperCase();
+  // ethers v6 transport-layer error codes → transient.
+  if (ethersCode === "NETWORK_ERROR" || ethersCode === "TIMEOUT" || ethersCode === "SERVER_ERROR") {
+    return true;
+  }
+  // A contract revert is a definitive answer, NOT a transport failure.
+  if (ethersCode === "CALL_EXCEPTION") return false;
+  // Node-level connection error codes, sometimes nested under cause/error.
+  const nested = String(e?.error?.code ?? e?.cause?.code ?? "").toUpperCase();
+  if (["ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"].includes(nested)) {
+    return true;
+  }
+  const msg = String(e?.message ?? err ?? "").toLowerCase();
+  return /timeout|timed out|etimedout|econnreset|econnrefused|enotfound|eai_again|fetch failed|socket hang up|could not detect network|network error/.test(
+    msg,
+  );
+}
+
+/**
  * Resolve a recipient string (0x address or .arc name) to a validated 0x address.
- * Throws if the input is invalid or the name is unregistered.
+ * Throws a typed AppError:
+ *   - RECIPIENT_NOT_FOUND (terminal)   — bad address, malformed name, or the
+ *                                        registry definitively has no owner.
+ *   - NETWORK (retryable, transient)   — the RPC lookup itself failed; we do
+ *                                        NOT know whether the name exists (F-17).
  * Used server-side before executing any agent transfer.
  */
 export async function resolveRecipient(input: string): Promise<string> {
@@ -67,16 +106,53 @@ export async function resolveRecipient(input: string): Promise<string> {
   const trimmed = input.trim();
 
   if (trimmed.startsWith("0x")) {
-    if (!isAddress(trimmed)) throw new Error(`Invalid wallet address: ${trimmed}`);
+    if (!isAddress(trimmed)) {
+      throw new AppError("RECIPIENT_NOT_FOUND", `Invalid wallet address: ${trimmed}`);
+    }
     return trimmed;
   }
 
   const label = normalizeName(trimmed);
   if (!/^[a-z0-9-]{3,32}$/.test(label)) {
-    throw new Error(`Invalid .arc name: ${trimmed}`);
+    throw new AppError("RECIPIENT_NOT_FOUND", `Invalid .arc name: ${trimmed}`);
   }
 
-  const address = await resolveName(label);
-  if (!address) throw new Error(`${label}.arc is not registered`);
+  // Resolve DIRECTLY (not via resolveName's catch-all→null) so a transient RPC
+  // failure can be told apart from a genuine "no owner" (F-17).
+  //
+  // D5: wrap the RPC read in withResilience — a single transient blip now
+  // self-heals with one bounded retry before we ever surface an error, and a
+  // sustained outage trips the shared "arc-rpc" breaker (which ANS + any other
+  // Arc RPC reader can share) so we fail fast instead of hanging per call. The
+  // retry predicate is `isTransientRpcError` (ethers-code aware), NOT the
+  // generic message matcher — a CALL_EXCEPTION (contract revert) is a
+  // definitive answer and must NOT be retried.
+  let address: string;
+  try {
+    address = await withResilience(() => registry.resolve(label) as Promise<string>, {
+      label: `ans/resolve(${label})`,
+      breakerKey: "arc-rpc",
+      timeoutMs: Number(process.env.ANS_TIMEOUT_MS ?? 8_000),
+      retries: Number(process.env.ANS_MAX_RETRIES ?? 1),
+      isRetryable: isTransientRpcError,
+    });
+  } catch (err) {
+    // withResilience only reaches here after retries are exhausted (transient)
+    // or immediately on a non-transient error. Re-derive the terminal/transient
+    // split from the ORIGINAL cause so the message + retryable stay F-17-correct.
+    const cause = err instanceof AppError ? err.originalCause ?? err : err;
+    if (isTransientRpcError(cause) || (err instanceof AppError && err.retryable)) {
+      throw new AppError(
+        "NETWORK",
+        `Couldn't verify ${label}.arc right now — the network is flaky. Try again in a moment.`,
+        { retryable: true, cause },
+      );
+    }
+    // Contract-level failure (revert etc.) → the name has no valid resolution.
+    throw new AppError("RECIPIENT_NOT_FOUND", `${label}.arc is not registered`, { cause });
+  }
+  if (!address || address === ZERO_ADDRESS) {
+    throw new AppError("RECIPIENT_NOT_FOUND", `${label}.arc is not registered`);
+  }
   return address;
 }

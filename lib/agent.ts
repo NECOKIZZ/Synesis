@@ -1,5 +1,5 @@
 /**
- * DotArc Smart Agent — server-only helpers.
+ * Synesis Smart Agent — server-only helpers.
  *
  * Covers:
  *  - PIN hashing / verification (Node crypto scrypt, no extra packages)
@@ -7,7 +7,7 @@
  *  - Circle developer-controlled agent wallet creation + USDC execution
  *  - OpenRouter (Claude) instruction interpretation
  *  - Spend-limit validation
- *  - Auth helper: requireAgentSession (DotArc JWT + Supabase UUID cross-check)
+ *  - Auth helper: requireAgentSession (Synesis JWT + Supabase UUID cross-check)
  */
 
 import "server-only";
@@ -47,17 +47,17 @@ export type AgentSession = {
   supabaseUserId: string;
 };
 
-// ── Auth: require both DotArc JWT + Supabase user ─────────────────────
+// ── Auth: require both Synesis JWT + Supabase user ─────────────────────
 
 /**
  * Layer 1 + ownership check guard for every agent API route.
  *
  * Validates:
- *  1. Valid DotArc JWT session (requireSession)
+ *  1. Valid Synesis JWT session (requireSession)
  *  2. Valid Supabase auth user exists in the same request context
  *  3. Email in the JWT matches the Supabase user email (prevents session swap)
  *
- * Returns the DotArc session plus the Supabase UUID needed for DB FKs.
+ * Returns the Synesis session plus the Supabase UUID needed for DB FKs.
  */
 export async function requireAgentSession(): Promise<AgentSession> {
   const session = await requireSession();
@@ -305,8 +305,14 @@ export function verifyPolicyHmac(
 /**
  * Create a new Circle developer-controlled wallet in the agent wallet set.
  * Requires CIRCLE_AGENT_WALLET_SET_ID to be set.
+ *
+ * `blockchain` defaults to ARC-TESTNET (the EVM agent wallet). Pass SOL-DEVNET
+ * to provision the agent's Solana wallet — a SEPARATE base58 address (Solana is
+ * EOA-only; no SCA). Both live in the same wallet set.
  */
-export async function createAgentWalletInCircle(): Promise<{
+export async function createAgentWalletInCircle(
+  blockchain: "ARC-TESTNET" | "SOL-DEVNET" = "ARC-TESTNET",
+): Promise<{
   walletId: string;
   address: string;
 }> {
@@ -316,7 +322,7 @@ export async function createAgentWalletInCircle(): Promise<{
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const res = await (circleDev as any).createWallets({
-    blockchains: ["ARC-TESTNET"],
+    blockchains: [blockchain],
     count: 1,
     walletSetId,
     accountType: "EOA",
@@ -360,6 +366,12 @@ const DISPLAY_USD_RATES: Record<string, number> = {
   CIRBTC: 100_000,
 };
 
+// Tokens we always surface to the model, even at zero balance, so SMART
+// BALANCE INFERENCE sees the full portfolio. Shared by the live path
+// (getAgentAllBalances) and the cache path (readBalanceCache) so the two
+// can never drift. Upper-case canonical form.
+const SUPPORTED_BALANCE_SYMBOLS = ["USDC", "EURC", "CIRBTC"] as const;
+
 export async function getAgentAllBalances(agentWalletId: string): Promise<AgentTokenBalance[]> {
   if (!circleDev) throw new Error("Circle dev client not configured");
   const res = await circleRead("getWalletTokenBalance(agent-all)", () =>
@@ -398,9 +410,8 @@ export async function getAgentAllBalances(agentWalletId: string): Promise<AgentT
 
   // Circle omits tokens with zero balance. Inject them so the model always
   // sees the full portfolio and can apply SMART BALANCE INFERENCE correctly.
-  const supportedSymbols = ["USDC", "EURC", "CIRBTC"];
   const presentSymbols = new Set(fromCircleDeduped.map((t) => t.symbol.toUpperCase()));
-  const zeroBalances: AgentTokenBalance[] = supportedSymbols
+  const zeroBalances: AgentTokenBalance[] = SUPPORTED_BALANCE_SYMBOLS
     .filter((s) => !presentSymbols.has(s))
     .map((symbol) => ({
       symbol,
@@ -412,6 +423,83 @@ export async function getAgentAllBalances(agentWalletId: string): Promise<AgentT
 
   return [...fromCircleDeduped, ...zeroBalances]
     .sort((a, b) => b.approxUsdValue - a.approxUsdValue);
+}
+
+// ── Cache-backed balance reader (V3.5 Track 1) ─────────────────────────
+//
+// The webhook (app/api/webhooks/circle/route.ts) maintains
+// agent_wallets.balance_cache as a { symbol: amountString } jsonb blob.
+// This is the read-side counterpart to getAgentAllBalances(): it converts
+// that blob into the SAME AgentTokenBalance[] shape the live path returns
+// — reusing DISPLAY_USD_RATES and the zero-balance injection — so the
+// interpret prompt sees an identical portfolio regardless of source.
+//
+// Pure + synchronous: the interpret route already fetches the agent_wallets
+// row, so it passes the columns straight in rather than paying a second DB
+// round-trip. Never throws; returns null when the cache can't be trusted
+// (missing/empty blob or unusable timestamp) so the caller falls back to
+// the live Circle read.
+//
+// TRUST MODEL: eventually consistent — the LLM's first-filter ONLY.
+// Spend-time gates MUST still read Circle live (see checkBalanceSufficient).
+
+export type BalanceCacheRead = {
+  balances: AgentTokenBalance[];
+  ageSeconds: number;
+};
+
+export function readBalanceCache(
+  cache: unknown,
+  cacheAt: string | null | undefined,
+): BalanceCacheRead | null {
+  // No freshness stamp → can't reason about staleness → don't trust it.
+  if (!cacheAt) return null;
+  const ts = Date.parse(cacheAt);
+  if (Number.isNaN(ts)) return null;
+
+  if (!cache || typeof cache !== "object") return null;
+  const entries = Object.entries(cache as Record<string, unknown>);
+  // Empty blob ({}) is "webhook hasn't populated yet" — fall back to live.
+  if (entries.length === 0) return null;
+
+  const deduped = new Map<string, AgentTokenBalance>();
+  for (const [rawSymbol, rawAmount] of entries) {
+    const symbol = String(rawSymbol);
+    const amount =
+      typeof rawAmount === "string" ? rawAmount : String(rawAmount ?? "0");
+    const amountNumber = parseFloat(amount);
+    if (!isFinite(amountNumber)) continue;
+    const rate = DISPLAY_USD_RATES[symbol.toUpperCase()] ?? 0;
+    deduped.set(symbol.toUpperCase(), {
+      symbol,
+      amount,
+      amountNumber,
+      tokenAddress: null, // cache doesn't persist token addresses
+      approxUsdValue: amountNumber * rate,
+    });
+  }
+
+  // Inject zero balances for any supported token the cache omitted —
+  // identical to getAgentAllBalances() so the prompt shape is stable.
+  for (const symbol of SUPPORTED_BALANCE_SYMBOLS) {
+    if (!deduped.has(symbol)) {
+      deduped.set(symbol, {
+        symbol,
+        amount: "0",
+        amountNumber: 0,
+        tokenAddress: null,
+        approxUsdValue: 0,
+      });
+    }
+  }
+
+  const ageSeconds = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  return {
+    balances: Array.from(deduped.values()).sort(
+      (a, b) => b.approxUsdValue - a.approxUsdValue,
+    ),
+    ageSeconds,
+  };
 }
 
 // ── Balance sufficiency check (shared by every money-moving skill) ────

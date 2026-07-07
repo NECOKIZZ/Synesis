@@ -447,6 +447,13 @@ export const CreatePolicy: SkillHandler = {
       : { ...normalizedSteps[0].params };
     const stepsForStorage = isCompound ? normalizedSteps : null;
 
+    // Cooldown MUST be stored and signed with the SAME value, or the cron's
+    // HMAC verify fails and the policy is deactivated ("HMAC verification
+    // failed"). The `agent_policies.cooldown_seconds` column defaults to 3600,
+    // so we must write this value EXPLICITLY (never `undefined`, which would
+    // let the DB default diverge from what we sign below).
+    const cooldownSeconds = triggerType === "price" ? 3600 : 0;
+
     // ── 9. Insert policy row (HMAC = "pending" first, then real) ─────
     const policyPayload = {
       trigger: task.trigger,
@@ -469,7 +476,7 @@ export const CreatePolicy: SkillHandler = {
         action_skill: actionSkill,
         action_params: actionParams,
         execution_mode: task.execution_mode,
-        cooldown_seconds: triggerType === "price" ? 3600 : undefined,
+        cooldown_seconds: cooldownSeconds,
         stop_conditions: stopConditions,
         steps: stepsForStorage,
         policy_summary: description || task.confirmation_message,
@@ -495,7 +502,7 @@ export const CreatePolicy: SkillHandler = {
       triggerType,
       triggerParams,
       executionMode: task.execution_mode,
-      cooldownSeconds: triggerType === "price" ? 3600 : 0,
+      cooldownSeconds,
       stopConditions,
       createdAt: policyRow.created_at,
       // Include steps in the HMAC for compound policies so tampering with

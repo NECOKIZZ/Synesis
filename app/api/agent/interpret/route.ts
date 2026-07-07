@@ -15,14 +15,19 @@
  */
 
 import { NextResponse } from "next/server";
-import { requireAgentSession, enforceAgentGate, getAgentAllBalances } from "@/lib/agent";
+import { requireAgentSession, enforceAgentGate, getAgentAllBalances, readBalanceCache } from "@/lib/agent";
 import { interpretInstructionV3 } from "@/lib/agent-core-v3";
+import { getLivePrices } from "@/lib/agent-core";
+import { selectSkills } from "@/lib/skill-router";
+import { formatInterpretDiagnostics, type BalanceSource } from "@/lib/agent-diagnostics";
+import type { SkillCatalogEntry } from "@/lib/skills/catalog";
 import type { AgentTokenBalance, InterpretResult } from "@/lib/agent-types";
 import { resolveRecipient } from "@/lib/ans";
-import { batchRequiresPin } from "@/lib/skills/pin-policy";
+import { toAppError } from "@/lib/errors";
+import { batchRequiresPin, totalUpfrontUsdc, batchAutoConfirm } from "@/lib/skills/pin-policy";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { createSupabaseServiceClient } from "@/lib/supabase/service";
-import { recallUserMemory, rememberNote } from "@/lib/memory";
+import { selectIntentMemory, getProfileCard } from "@/lib/memory";
 import { walrusEnabled, walrusRecall, walrusRemember } from "@/lib/memory/walrus-adapter";
 import { checkRateLimit } from "@/lib/rate-limit";
 import crypto from "node:crypto";
@@ -97,57 +102,46 @@ export async function POST(req: Request) {
   console.log(`[agent/interpret] trace=${traceId} instruction="${instruction}" user=${supabaseUserId}`);
 
   // ── Memory introspection fast-path: "what do you remember…" ──────
-  // Returns the user's stored facts as a friendly list. Pulls from
-  // BOTH Layer B (Supabase, structured) and Layer C (Walrus, semantic),
-  // dedupes, and renders via the chat unknown_reason channel. No LLM
-  // round-trip — the data IS the answer.
+  // Returns the user's stored facts as a friendly list, recalled from
+  // MemWal (the single learned-memory store). Rendered via the chat
+  // unknown_reason channel — no LLM round-trip, the data IS the answer.
   if (isMemoryIntrospectionRequest(instruction)) {
-    const supabaseRO = await createSupabaseServerClient();
-    const [layerB, layerC] = await Promise.all([
-      recallUserMemory(supabaseRO, supabaseUserId, 20).catch(() => ""),
-      walrusEnabled()
-        ? walrusRecall(supabaseUserId, "user habits preferences contacts notes facts", 10).catch(
-            () => [] as string[],
-          )
-        : Promise.resolve([] as string[]),
-    ]);
-    const lines = renderMemoryListing(layerB, layerC);
+    const facts = walrusEnabled()
+      ? await walrusRecall(
+          supabaseUserId,
+          "user habits preferences contacts notes facts communication style",
+          15,
+        ).catch(() => [] as string[])
+      : [];
+    const lines = renderMemoryListing(facts);
     const reply: InterpretResult = {
       tasks: [],
       combined_confirmation_message: "",
       unknown_reason: lines
         ? `Here's what I remember about you:\n\n${lines}`
-        : "I don't have any memories about you yet. Send to a contact a few times, or tell me \"remember…\" to teach me something explicit.",
+        : "I don't have any memories about you yet. Use the wallet a few times, or tell me \"remember…\" to teach me something explicit.",
     };
     return NextResponse.json({ ...reply, requires_pin: false });
   }
 
-  // ── Layer C: explicit "remember this" fast-path ───────────────────
-  // When the user explicitly tells the agent to remember something,
-  // skip the LLM round-trip entirely. Persist to BOTH Layer B (Supabase
-  // note row, RLS-bound, durable) and Layer C (Walrus, semantic, only
-  // if MEMWAL_ENABLED). Either failing must NOT block the reply.
+  // ── Explicit "remember this" fast-path ────────────────────────────
+  // When the user explicitly tells the agent to remember something, skip
+  // the LLM round-trip and persist it to MemWal (the single learned-memory
+  // store) as a dated [note] fact. Best-effort — a write failure must not
+  // block the reply.
   const rememberMatch = instruction.match(
     /^\s*(?:please\s+)?remember(?:\s+(?:that|this(?:\s*[:,-])?))?\s+(.+)$/i,
   );
   if (rememberMatch) {
     const note = rememberMatch[1].trim();
     if (note.length >= 3) {
-      const service = createSupabaseServiceClient();
-      const writes: Promise<unknown>[] = [
-        rememberNote(service, supabaseUserId, note).catch((err) =>
-          console.warn(`[agent/interpret] trace=${traceId} layer-B remember failed:`, err),
-        ),
-      ];
+      const today = new Date().toISOString().slice(0, 10);
       if (walrusEnabled()) {
-        writes.push(
-          walrusRemember(supabaseUserId, note).catch((err) =>
-            console.warn(`[agent/interpret] trace=${traceId} layer-C remember failed:`, err),
-          ),
+        await walrusRemember(supabaseUserId, `[note] (${today}) ${note}`).catch((err) =>
+          console.warn(`[agent/interpret] trace=${traceId} memwal remember failed:`, err),
         );
       }
-      await Promise.allSettled(writes);
-      console.log(`[agent/interpret] trace=${traceId} remembered note (walrus=${walrusEnabled() ? "yes" : "no"})`);
+      console.log(`[agent/interpret] trace=${traceId} remembered note (memwal=${walrusEnabled() ? "yes" : "no"})`);
       const reply: InterpretResult = {
         tasks: [],
         combined_confirmation_message: "",
@@ -162,7 +156,7 @@ export async function POST(req: Request) {
   // ── Agent wallet ──────────────────────────────────────────────────
   const { data: wallet } = await supabase
     .from("agent_wallets")
-    .select("circle_wallet_id")
+    .select("circle_wallet_id, balance_cache, balance_cache_at")
     .eq("user_id", supabaseUserId)
     .maybeSingle();
   if (!wallet) {
@@ -170,13 +164,43 @@ export async function POST(req: Request) {
   }
 
   // ── Balance + limits context for the LLM ──────────────────────────
+  // V3.5 Track 1: prefer the webhook-maintained balance cache (a fast DB
+  // read we already have in hand) over a live Circle round-trip — the
+  // dominant latency cost in the pre-LLM path. The cache is eventually
+  // consistent and feeds the LLM's first-filter ONLY; spend-time gates
+  // still read Circle live. Fall back to live when the flag is off, or
+  // when the cache is missing / empty / stale (>10 min).
+  const BALANCE_CACHE_ENABLED = process.env.BALANCE_CACHE_ENABLED === "true";
+  const BALANCE_CACHE_MAX_AGE_S = 600;
+
   let agentBalanceUsdc = "0";
   let allBalances: AgentTokenBalance[] = [];
-  try {
-    allBalances = await getAgentAllBalances(wallet.circle_wallet_id);
-    agentBalanceUsdc = allBalances.find((b) => b.symbol === "USDC")?.amount ?? "0";
-  } catch {
-    // non-fatal — Claude will see "0" and pick safe defaults
+  let balanceServed = false;
+  // Diagnostics: which path served the balance, and how stale it was. Fed
+  // into the unified interpret-diagnostics block below (block #2).
+  let balanceSource: BalanceSource = "unavailable";
+  let balanceAgeSeconds: number | null = null;
+
+  if (BALANCE_CACHE_ENABLED) {
+    const cached = readBalanceCache(wallet.balance_cache, wallet.balance_cache_at);
+    if (cached && cached.ageSeconds <= BALANCE_CACHE_MAX_AGE_S) {
+      allBalances = cached.balances;
+      agentBalanceUsdc = allBalances.find((b) => b.symbol === "USDC")?.amount ?? "0";
+      balanceServed = true;
+      balanceSource = "cache";
+      balanceAgeSeconds = cached.ageSeconds;
+    }
+  }
+
+  if (!balanceServed) {
+    try {
+      allBalances = await getAgentAllBalances(wallet.circle_wallet_id);
+      agentBalanceUsdc = allBalances.find((b) => b.symbol === "USDC")?.amount ?? "0";
+      balanceSource = "live";
+    } catch {
+      // non-fatal — Claude will see "0" and pick safe defaults; source
+      // stays "unavailable" so the diagnostics block flags the gap.
+    }
   }
 
   const { data: limitsRow } = await supabase
@@ -191,6 +215,39 @@ export async function POST(req: Request) {
     max_weekly_usdc: Number(limitsRow?.max_weekly_usdc ?? 300),
     max_monthly_usdc: Number(limitsRow?.max_monthly_usdc ?? 500),
   };
+  // Diagnostics flag: did these come from a user_spend_limits row, or are we
+  // showing the model the hardcoded defaults? (block #3)
+  const limitsFromDb = !!limitsRow;
+
+  // ── User identity (V3.5 Track 3) ──────────────────────────────────
+  // Tell the model which .arc user it's serving so it can personalise
+  // wording and resolve first-person references. Behind a flag — when off,
+  // no fetch happens and the prompt stays byte-identical to V3. A freshly
+  // registered user with a null arc_name simply yields undefined (no line).
+  const IDENTITY_INJECT_ENABLED = process.env.AGENT_IDENTITY_INJECT === "true";
+  let userArcName: string | undefined;
+  if (IDENTITY_INJECT_ENABLED) {
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("arc_name")
+      .eq("id", supabaseUserId)
+      .maybeSingle();
+    userArcName = profile?.arc_name ?? undefined;
+  }
+
+  // ── User profile (durable always-on personalization, migration 0018) ──
+  // The curated card (communication style + standing prefs), injected on
+  // every call right after the identity line — the always-on layer MemWal's
+  // semantic recall can't guarantee. Behind a flag; best-effort (a miss
+  // yields "" and the block is simply omitted).
+  const USER_PROFILE_ENABLED = process.env.USER_PROFILE_ENABLED === "true";
+  let userProfile = "";
+  if (USER_PROFILE_ENABLED) {
+    userProfile = await getProfileCard(supabase, supabaseUserId);
+    console.log(
+      `[agent/interpret] trace=${traceId} [profile] ${userProfile ? `injected ${userProfile.length}ch` : "no card yet"}`,
+    );
+  }
 
   // ── Active policies (interpreter context) ─────────────────────────
   const { data: activePolicies } = await supabase
@@ -209,37 +266,143 @@ export async function POST(req: Request) {
     mode: p.execution_mode,
   }));
 
-  // ── Layer B + C memory recall (habits/preferences/notes) ──────────
-  // Non-fatal: a memory failure must never block interpretation. Layer B
-  // (Supabase) is RLS-scoped via the server client. Layer C (Walrus) is
-  // a semantic search over the user's namespace, queried with the live
-  // instruction so the model gets contextually-relevant facts. Both
-  // sources are merged into ONE delimited block; the prompt already
-  // tells the model to treat memory as untrusted background data.
+  // ── MemWal episodic recall (learned facts: prefs / open loops / notes) ──
+  // Non-fatal: a memory failure must never block interpretation. Semantic
+  // search over the user's MemWal namespace, queried with the live
+  // instruction so the model gets contextually-relevant facts. Rendered as
+  // a delimited block; the prompt treats memory as untrusted background data.
   let memoryContext = "";
-  try {
-    const [layerB, layerC] = await Promise.all([
-      recallUserMemory(supabase, supabaseUserId).catch((err) => {
-        console.warn(`[agent/interpret] trace=${traceId} layer-B recall failed:`, err);
-        return "";
-      }),
-      walrusEnabled()
-        ? walrusRecall(supabaseUserId, instruction, 3).catch((err) => {
-            console.warn(`[agent/interpret] trace=${traceId} layer-C recall failed:`, err);
-            return [] as string[];
-          })
-        : Promise.resolve([] as string[]),
-    ]);
-    const layerCBlock = layerC.length
-      ? layerC.map((f) => `- ${f.replace(/^\[session-summary\]\s*/i, "")}`).join("\n")
-      : "";
-    memoryContext = [layerB, layerCBlock].filter(Boolean).join("\n");
-    if (layerC.length) {
-      console.log(`[agent/interpret] trace=${traceId} layer-C recalled ${layerC.length} fact(s)`);
+  // Diagnostics: how many facts MemWal contributed this call (block #8).
+  let memFactCount = 0;
+  if (walrusEnabled()) {
+    try {
+      const facts = await walrusRecall(supabaseUserId, instruction, 3).catch((err) => {
+        console.warn(`[agent/interpret] trace=${traceId} memwal recall failed:`, err);
+        return [] as string[];
+      });
+      memFactCount = facts.length;
+      memoryContext = facts.length
+        ? facts.map((f) => `- ${stripMemoryTag(f)}`).join("\n")
+        : "";
+    } catch (err) {
+      console.warn(`[agent/interpret] trace=${traceId} memory recall failed:`, err);
     }
-  } catch (err) {
-    console.warn(`[agent/interpret] trace=${traceId} memory recall failed:`, err);
   }
+
+  // ── Skill router (V3.5 Track 4) ───────────────────────────────────
+  // Embed the instruction and pull the top-K most relevant skills so the
+  // prompt carries only the catalog entries that matter for this message.
+  // Behind a flag — when off, skillsToInject stays undefined and the prompt
+  // builder renders its hardcoded full catalog (byte-identical to V3). The
+  // router never throws (it self-falls-back to the full catalog on any
+  // failure); the extra try/catch is belt-and-braces so a router outage can
+  // never break interpret.
+  const SKILL_ROUTER_ENABLED = process.env.SKILL_ROUTER_ENABLED === "true";
+  let skillsToInject: SkillCatalogEntry[] | undefined;
+  // Diagnostics: exactly what the vector router injected this call (block #6).
+  const routerDiag = {
+    enabled: SKILL_ROUTER_ENABLED,
+    selected: [] as string[],
+    topCosine: null as number | null,
+    usedFallback: false,
+    fallbackReason: undefined as string | undefined,
+  };
+  if (SKILL_ROUTER_ENABLED) {
+    try {
+      // Service client: the router reads admin-curated skill data (not user-
+      // scoped) AND logs low-confidence misses to skill_router_misses, which
+      // is service-role-only by design. The RLS-bound user client can't insert
+      // there, so the router runs on the service client.
+      const selected = await selectSkills(createSupabaseServiceClient(), instruction, {
+        userId: supabaseUserId,
+        traceId,
+      });
+      skillsToInject = selected.skills;
+      routerDiag.selected = selected.skills.map((s) => s.skill_name);
+      routerDiag.topCosine = selected.topCosine;
+      routerDiag.usedFallback = selected.usedFallback;
+      routerDiag.fallbackReason = selected.fallbackReason;
+    } catch (err) {
+      // Leave skillsToInject undefined → prompt builder uses full catalog.
+      routerDiag.usedFallback = true;
+      routerDiag.fallbackReason = "route_exception";
+      console.warn(`[agent/interpret] trace=${traceId} [router] unexpected failure — using full catalog:`, err);
+    }
+  }
+
+  // ── Intent-gated contact memory (V3.5+) ───────────────────────────
+  // Drive memory injection off the router's CONFIDENT output: if it selected
+  // a contact-feeding skill (SEND_USDC / SEND_TOKEN), inject the contact
+  // digest; otherwise inject nothing. This is why "hello" gets no contact
+  // memory and "send sara 5" does — same embedding, no second classifier.
+  //
+  // CRITICAL: when the router FELL BACK to the full catalog (low confidence /
+  // error), it has NOT identified an intent — it injected everything as
+  // insurance. Treating that as "user wants to send" would fire the contact
+  // bucket on ANY ambiguous message (e.g. "hi" → full catalog includes
+  // SEND_USDC → contact digest). So on fallback we pass an EMPTY selection:
+  // no confident intent → no intent-specific memory.
+  // Behind a flag; best-effort (a memory miss never breaks interpret).
+  const CONTACT_MEM_INJECT = process.env.CONTACT_MEM_INJECT === "true";
+  let contactMemory = "";
+  const contactMemDiag = {
+    enabled: CONTACT_MEM_INJECT,
+    injected: false,
+    bucket: null as string | null,
+    triggerSkill: null as string | null,
+    count: 0,
+  };
+  if (CONTACT_MEM_INJECT) {
+    try {
+      const intentSkills = routerDiag.usedFallback ? [] : routerDiag.selected;
+      const im = await selectIntentMemory(supabase, supabaseUserId, intentSkills);
+      contactMemory = im.block;
+      contactMemDiag.injected = !!im.block;
+      contactMemDiag.bucket = im.bucket;
+      contactMemDiag.triggerSkill = im.triggerSkill;
+      contactMemDiag.count = im.count;
+    } catch (err) {
+      console.warn(`[agent/interpret] trace=${traceId} contact-mem inject failed:`, err);
+    }
+  }
+
+  // ── Live prices (oracle) ──────────────────────────────────────────
+  // Fetch here (rather than letting interpretInstructionV3 fetch lazily) so
+  // the diagnostics block can report them AND we avoid a second oracle call.
+  // getLivePrices has its own fallback; the catch is belt-and-braces.
+  const livePrices = await getLivePrices().catch(() => ({
+    eurcUsdc: 1.08,
+    cirBtcUsdc: 100_000,
+  }));
+
+  // ── Unified interpret diagnostics (all 8 LLM inputs, one block) ────
+  // Single console.log so the whole block lands as one write and never
+  // interleaves with concurrent requests. This is the demo-triage view:
+  // "what did the model actually see?" at a glance.
+  console.log(
+    formatInterpretDiagnostics({
+      traceId,
+      instruction,
+      userArcName,
+      identityInjectEnabled: IDENTITY_INJECT_ENABLED,
+      profileChars: userProfile.length,
+      balances: allBalances,
+      balanceSource,
+      balanceAgeSeconds,
+      balanceCacheEnabled: BALANCE_CACHE_ENABLED,
+      limits,
+      limitsFromDb,
+      policies: formattedPolicies,
+      history,
+      router: routerDiag,
+      livePrices,
+      memory: {
+        factCount: memFactCount,
+        walrusEnabled: walrusEnabled(),
+      },
+      contactMem: contactMemDiag,
+    }),
+  );
 
   // ── OpenRouter call (V3 prompt + validator) ───────────────────────
   let result: InterpretResult;
@@ -253,6 +416,11 @@ export async function POST(req: Request) {
         activePolicies: formattedPolicies,
         allBalances,
         memoryContext,
+        contactMemory,
+        userArcName,
+        userProfile,
+        skillsToInject,
+        livePrices,
       },
     });
     console.log(
@@ -260,9 +428,23 @@ export async function POST(req: Request) {
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[agent/interpret] trace=${traceId} OpenRouter error: ${msg}`);
+    // `fetch failed` from undici is a generic wrapper — the ACTUAL reason
+    // (UND_ERR_CONNECT_TIMEOUT, ECONNRESET, ENOTFOUND, cert error, abort)
+    // lives on err.cause, which the old handler threw away. Surface it so a
+    // transport failure is diagnosable instead of opaque.
+    const cause = err && typeof err === "object" && "cause" in err ? (err as { cause?: unknown }).cause : undefined;
+    const causeCode =
+      cause && typeof cause === "object" && "code" in cause ? (cause as { code?: unknown }).code : undefined;
+    console.error(
+      `[agent/interpret] trace=${traceId} OpenRouter error: ${msg}` +
+        `${causeCode ? ` cause_code=${String(causeCode)}` : ""}`,
+      cause ?? "",
+    );
+    // Real, detailed cause stays in the server logs. The client only ever sees
+    // the friendly copy mapped from "AI interpretation failed" in
+    // lib/friendly-errors.ts — never the internal OPENROUTER_API_KEY hint.
     return NextResponse.json(
-      { error: "AI interpretation failed. Check OPENROUTER_API_KEY." },
+      { error: "AI interpretation failed" },
       { status: 502 },
     );
   }
@@ -273,24 +455,44 @@ export async function POST(req: Request) {
     try {
       await resolveRecipient(name);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : `Cannot resolve "${name}"`;
-      console.warn(`[agent/interpret] trace=${traceId} recipient_fail="${name}" msg="${msg}"`);
-      // Don't throw — degrade the result to an "unknown" outcome so the
-      // chat shows the user a clean error instead of a 500.
+      const appErr = toAppError(err);
+      const msg = appErr.message || `Cannot resolve "${name}"`;
+      console.warn(
+        `[agent/interpret] trace=${traceId} recipient_fail="${name}" code=${appErr.code} retryable=${appErr.retryable} msg="${msg}"`,
+      );
+      // Don't throw — degrade the result to an "unknown" outcome so the chat
+      // shows a clean error instead of a 500. On a TRANSIENT lookup failure
+      // (F-17) the name may be perfectly valid — surface the "try again"
+      // message as-is and do NOT tell the user to check the name. Only a
+      // terminal RECIPIENT_NOT_FOUND warrants "check the .arc name".
       const degraded: InterpretResult = {
         tasks: [],
         combined_confirmation_message: msg,
-        unknown_reason: `${msg}. Please check the .arc name or wallet address and try again.`,
+        unknown_reason: appErr.retryable
+          ? msg
+          : `${msg}. Please check the .arc name or wallet address and try again.`,
       };
       return NextResponse.json({ ...degraded, requires_pin: false }, { status: 200 });
     }
   }
 
-  // Tell the client whether the PIN input should appear on the
-  // confirmation card. Read-only batches (CHECK_BALANCE, LIST_POLICIES,
-  // SET_LIMIT, SWAP_USDC, etc.) skip the PIN UX entirely.
-  const requiresPin = batchRequiresPin(result.tasks, agentSession.session.walletAddress);
-  return NextResponse.json({ ...result, requires_pin: requiresPin });
+  // Ship the server-computed gating authority so the client renders decisions
+  // instead of re-deriving them (D2 fix — kills the F-7 client balance denylist
+  // and the F-8 client auto-confirm allowlist). All three come from the shared
+  // pin-policy SSOT:
+  //   requires_pin  — show the PIN input? (outward third-party sends only)
+  //   upfront_usdc  — USDC drawn up front across "now" tasks; the client fast-
+  //                   fails on insufficient balance using THIS, not its own sum
+  //   auto_confirm  — skip the confirm card entirely (no-PIN batches: reads,
+  //                   config, same-user withdraw/swap/self-bridge)
+  const walletAddress = agentSession.session.walletAddress;
+  const requiresPin = batchRequiresPin(result.tasks, walletAddress);
+  return NextResponse.json({
+    ...result,
+    requires_pin: requiresPin,
+    upfront_usdc: totalUpfrontUsdc(result.tasks),
+    auto_confirm: batchAutoConfirm(result.tasks, walletAddress),
+  });
 }
 
 /**
@@ -314,24 +516,30 @@ function isMemoryIntrospectionRequest(instruction: string): boolean {
  * array) into a single deduped, numbered listing. Walrus session-summary
  * tags are stripped so the user sees clean prose.
  */
-function renderMemoryListing(layerB: string, layerC: string[]): string {
+function renderMemoryListing(facts: string[]): string {
   const seen = new Set<string>();
   const items: string[] = [];
 
-  const pushUnique = (raw: string) => {
-    const cleaned = raw.replace(/^\s*[-•]\s*/, "").replace(/^\[session-summary\]\s*/i, "").trim();
-    if (!cleaned) return;
+  for (const fact of facts) {
+    const cleaned = stripMemoryTag(fact).replace(/^\s*[-•]\s*/, "").trim();
+    if (!cleaned) continue;
     const key = cleaned.toLowerCase().slice(0, 80);
-    if (seen.has(key)) return;
+    if (seen.has(key)) continue;
     seen.add(key);
     items.push(cleaned);
-  };
-
-  for (const line of layerB.split("\n")) pushUnique(line);
-  for (const fact of layerC) pushUnique(fact);
+  }
 
   if (items.length === 0) return "";
   return items.map((s, i) => `${i + 1}. ${s}`).join("\n");
+}
+
+/**
+ * Strip a leading MemWal storage tag (`[session-summary]`, `[note]`, …)
+ * from a recalled fact while preserving any `(YYYY-MM-DD)` date that
+ * follows it, so the model still sees when the fact was recorded.
+ */
+function stripMemoryTag(fact: string): string {
+  return fact.replace(/^\s*\[[^\]]+\]\s*/, "").trim();
 }
 
 /**

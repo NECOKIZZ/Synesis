@@ -29,6 +29,8 @@ import { NextResponse } from "next/server";
 import crypto from "node:crypto";
 import { createSupabaseServiceClient } from "@/lib/supabase/service";
 import { readUsdcBalanceWei, getUserWallet } from "@/lib/circle";
+import { getAgentAllBalances } from "@/lib/agent";
+import { recordContactInteraction } from "@/lib/memory";
 import { formatUnits } from "ethers";
 
 export const runtime = "nodejs";
@@ -83,6 +85,10 @@ interface MatchedWallet {
   userId: string;
   walletKind: WalletKind;
   walletAddress: string; // canonical lower-case form
+  // Only populated for agent matches. Needed so refreshBalanceCache can
+  // call getAgentAllBalances() (which is keyed by Circle wallet id, not
+  // by on-chain address) without an extra DB round-trip.
+  circleWalletId?: string;
 }
 
 type SupabaseService = ReturnType<typeof createSupabaseServiceClient>;
@@ -183,20 +189,31 @@ async function findWalletOwner(
   // Agent wallet fallback.
   const { data: agent } = await supabase
     .from("agent_wallets")
-    .select("user_id")
+    .select("user_id, circle_wallet_id")
     .ilike("circle_wallet_address", lower)
     .maybeSingle();
   if (agent?.user_id) {
-    return { userId: agent.user_id, walletKind: "agent", walletAddress: lower };
+    return {
+      userId: agent.user_id,
+      walletKind: "agent",
+      walletAddress: lower,
+      circleWalletId: agent.circle_wallet_id ?? undefined,
+    };
   }
 
   return null;
 }
 
 /**
- * Re-fetch the wallet's USDC balance from Arc and write it to the cache
- * column on the corresponding row. Best-effort — RPC failures here don't
+ * Re-fetch the wallet's balance(s) from Arc and write to the cache
+ * columns on the corresponding row. Best-effort — RPC failures here don't
  * abort the webhook (the row insert was the important part).
+ *
+ * Main wallet: refreshes USDC only (balance_cache_usdc).
+ * Agent wallet: refreshes USDC AND the multi-token balance_cache jsonb so
+ *   the interpret route can build a full balance snapshot without hitting
+ *   Circle live (V3.5 Track 1). If the multi-token call fails, the USDC
+ *   write still goes through.
  */
 async function refreshBalanceCache(
   supabase: SupabaseService,
@@ -206,19 +223,43 @@ async function refreshBalanceCache(
     const raw = await readUsdcBalanceWei(match.walletAddress, USDC_ADDRESS);
     const formatted = formatUnits(raw, USDC_DECIMALS);
 
-    const patch = {
-      balance_cache_usdc: formatted,
-      balance_cache_at: new Date().toISOString(),
-    };
+    const nowIso = new Date().toISOString();
 
     if (match.walletKind === "main") {
-      await supabase.from("profiles").update(patch).eq("id", match.userId);
-    } else {
       await supabase
-        .from("agent_wallets")
-        .update(patch)
-        .eq("user_id", match.userId);
+        .from("profiles")
+        .update({ balance_cache_usdc: formatted, balance_cache_at: nowIso })
+        .eq("id", match.userId);
+      return;
     }
+
+    // Agent path: also refresh the multi-token jsonb cache. Best-effort —
+    // a failure here must not block the USDC write.
+    let multiToken: Record<string, string> | null = null;
+    if (match.circleWalletId) {
+      try {
+        const tokens = await getAgentAllBalances(match.circleWalletId);
+        multiToken = Object.fromEntries(tokens.map((t) => [t.symbol, t.amount]));
+      } catch (err) {
+        // Non-fatal: we'll still write USDC, and the interpret route's
+        // staleness check will fall back to live on the next call.
+        console.warn(
+          "[webhooks/circle] multi-token balance refresh failed (USDC only persisted):",
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+
+    const patch: Record<string, unknown> = {
+      balance_cache_usdc: formatted,
+      balance_cache_at: nowIso,
+    };
+    if (multiToken) patch.balance_cache = multiToken;
+
+    await supabase
+      .from("agent_wallets")
+      .update(patch)
+      .eq("user_id", match.userId);
   } catch (err) {
     // Don't block the webhook ack on a flaky RPC call — the next webhook
     // (or a manual UI fetch) will re-cache.
@@ -331,6 +372,10 @@ async function recordOutbound(args: {
     .maybeSingle();
 
   if (byCircleId?.id) {
+    // Re-delivery of an already-recorded tx. Update status only — do NOT
+    // bump contact_mem here, or a CONFIRMED-then-COMPLETE pair would
+    // double-count. The contact bump happens exactly once, in the
+    // first-transition branches below.
     await supabase
       .from("agent_spend_log")
       .update({ status, tx_hash: txHash })
@@ -341,7 +386,7 @@ async function recordOutbound(args: {
   const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
   const { data: candidates } = await supabase
     .from("agent_spend_log")
-    .select("id")
+    .select("id, skill, recipient_arc_name, token_symbol")
     .eq("user_id", match.userId)
     .eq("wallet_type", "agent")
     .eq("status", "PENDING")
@@ -351,6 +396,12 @@ async function recordOutbound(args: {
     .limit(1);
 
   if (candidates && candidates.length > 0) {
+    const claimed = candidates[0] as {
+      id: string;
+      skill: string | null;
+      recipient_arc_name: string | null;
+      token_symbol: string | null;
+    };
     await supabase
       .from("agent_spend_log")
       .update({
@@ -359,12 +410,26 @@ async function recordOutbound(args: {
         circle_tx_id: notificationId,
         idempotency_key: notificationId,
       })
-      .eq("id", candidates[0].id);
+      .eq("id", claimed.id);
+    // First PENDING→terminal transition for this send → bump contact (out).
+    // notification.amounts[0] (amountUsdc here) is the NATIVE token amount;
+    // pairing it with the row's token_symbol lets the recorder value it in
+    // USD correctly (e.g. 10 EURC → ~$10.80).
+    await bumpOutboundContact({
+      supabase,
+      userId: match.userId,
+      state,
+      skill: claimed.skill,
+      alias: claimed.recipient_arc_name,
+      token: claimed.token_symbol ?? "USDC",
+      counterpartyAddress,
+      amount: amountUsdc,
+    });
     return;
   }
 
   if (status !== "PENDING") {
-    await supabase.from("agent_spend_log").insert({
+    const { error } = await supabase.from("agent_spend_log").insert({
       user_id: match.userId,
       wallet_type: "agent",
       skill: "AGENT_SEND",
@@ -375,7 +440,59 @@ async function recordOutbound(args: {
       idempotency_key: notificationId,
       status,
     });
+    // New row (a re-delivery trips the unique circle_tx_id index → 23505,
+    // and we skip) → bump contact (out) exactly once. No originating skill
+    // row to read a token off → assume USDC (the webhook-initiated path is
+    // USDC-denominated).
+    if (!error) {
+      await bumpOutboundContact({
+        supabase,
+        userId: match.userId,
+        state,
+        skill: "AGENT_SEND",
+        alias: null,
+        token: "USDC",
+        counterpartyAddress,
+        amount: amountUsdc,
+      });
+    }
   }
+}
+
+/**
+ * Bump the outbound side of contact_mem for a confirmed agent send.
+ * Best-effort + isolated. Guards:
+ *   - only on terminal SUCCESS (a FAILED send is not a relationship signal)
+ *   - skip WITHDRAW (counterparty is the user's own main wallet, not a contact)
+ *   - skip missing counterparty
+ * Amount is USDC-denominated today (the spend log tracks USDC only); when
+ * multi-token sends ship, add a token column to agent_spend_log and read it
+ * here for precise per-token valuation.
+ */
+async function bumpOutboundContact(args: {
+  supabase: SupabaseService;
+  userId: string;
+  state: CircleTxState;
+  skill: string | null;
+  alias: string | null;
+  token: string;
+  counterpartyAddress: string | null;
+  amount: number;
+}): Promise<void> {
+  const { supabase, userId, state, skill, alias, token, counterpartyAddress, amount } = args;
+  if (!isTerminalSuccess(state)) return;
+  if (!counterpartyAddress) return;
+  if (skill === "WITHDRAW") return;
+  await recordContactInteraction(supabase, userId, {
+    address: counterpartyAddress,
+    alias,
+    direction: "out",
+    token,
+    amount,
+    skill: skill ?? "AGENT_SEND",
+  }).catch((err) =>
+    console.warn("[webhooks/circle] contact-mem outbound bump failed:", err),
+  );
 }
 
 /**
@@ -425,6 +542,21 @@ async function recordInbound(args: {
   });
   if (error && error.code !== "23505") {
     console.error("[webhooks/circle] inbound (agent) insert failed:", error);
+  }
+
+  // Contact memory (inbound side). Only bump on a GENUINELY NEW row: a
+  // re-delivery trips the unique circle_tx_id index (error 23505) and we
+  // skip, so the counter can never double-count. Best-effort + isolated.
+  if (!error && senderAddress) {
+    await recordContactInteraction(supabase, match.userId, {
+      address: senderAddress,
+      direction: "in",
+      token: "USDC",
+      amount: amountUsdc,
+      skill: "RECEIVE",
+    }).catch((err) =>
+      console.warn("[webhooks/circle] contact-mem inbound bump failed:", err),
+    );
   }
 }
 

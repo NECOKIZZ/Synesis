@@ -1,7 +1,7 @@
 /**
  * errors.ts
  *
- * Typed error contract for the DotArc app.
+ * Typed error contract for the Synesis app.
  *
  * Every error that flows through the app can be classified into one of the
  * `ErrorCode` values below. Code that catches an error can then decide
@@ -204,7 +204,7 @@ function extractRawMessage(err: unknown): string {
 const CLASSIFIERS: Array<{ test: RegExp; code: ErrorCode }> = [
   // Auth
   { test: /invalid.*one[- ]?time.*password|invalid.*otp|expired.*token|otp.*expired/i, code: "AUTH_INVALID_CODE" },
-  { test: /rate ?limit|too many requests|\b429\b/i, code: "AUTH_RATE_LIMIT" },
+  { test: /rate ?limit|too many requests|(?:HTTP|status(?:\s*code)?)\s*429\b/i, code: "AUTH_RATE_LIMIT" },
   { test: /bad_oauth_state|oauth state/i, code: "AUTH_OAUTH_STATE" },
 
   // PIN / Circle
@@ -234,12 +234,14 @@ const CLASSIFIERS: Array<{ test: RegExp; code: ErrorCode }> = [
   { test: /failed to fetch|networkerror|network.*error|fetch.*failed|econnreset|socket.*hang up/i, code: "NETWORK" },
   { test: /timeout|timed out|etimedout|aborted/i, code: "TIMEOUT" },
 
-  // HTTP
-  { test: /\b401\b|unauthori[sz]ed/i, code: "UNAUTHORIZED" },
-  { test: /\b403\b|forbidden/i, code: "FORBIDDEN" },
-  { test: /\b404\b|not found/i, code: "NOT_FOUND" },
-  { test: /\b5\d{2}\b|server error/i, code: "SERVER_ERROR" },
-  { test: /\b4\d{2}\b|bad request/i, code: "BAD_REQUEST" },
+  // HTTP — numeric codes require an HTTP/status prefix so a bare 3-digit number
+  // in prose (e.g. "max 500 chars", "550 USDC") is NOT misclassified as an
+  // error status. The word alternates still catch real HTTP failures.
+  { test: /(?:HTTP|status(?:\s*code)?)\s*401\b|unauthori[sz]ed/i, code: "UNAUTHORIZED" },
+  { test: /(?:HTTP|status(?:\s*code)?)\s*403\b|forbidden/i, code: "FORBIDDEN" },
+  { test: /(?:HTTP|status(?:\s*code)?)\s*404\b|not found/i, code: "NOT_FOUND" },
+  { test: /(?:HTTP|status(?:\s*code)?)\s*5\d{2}\b|server error/i, code: "SERVER_ERROR" },
+  { test: /(?:HTTP|status(?:\s*code)?)\s*4\d{2}\b|bad request/i, code: "BAD_REQUEST" },
 ];
 
 function classifyMessage(raw: string, fallback: ErrorCode): ErrorCode {

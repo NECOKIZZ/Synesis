@@ -1,5 +1,5 @@
 /**
- * DotArc Smart Agent — V4 SAMPLE (function calling / tool use).
+ * Synesis Smart Agent — V4 SAMPLE (function calling / tool use).
  *
  * This is a DESIGN ONLY file — not wired into the app. It shows how
  * the system prompt shrinks when we switch from prose-based JSON
@@ -34,7 +34,7 @@
 /*  SYSTEM PROMPT — what the LLM sees as "instructions"               */
 /* ──────────────────────────────────────────────────────────────────── */
 
-const SYSTEM_PROMPT_V4 = `You are DotArc's wallet assistant.
+const SYSTEM_PROMPT_V4 = `You are Synesis's wallet assistant.
 
 Use the available tools to plan the user's request.
 Return ALL necessary steps in one response.

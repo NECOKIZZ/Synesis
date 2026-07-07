@@ -1,5 +1,5 @@
 /**
- * DotArc Smart Agent — pure logic helpers (no server-only deps).
+ * Synesis Smart Agent — pure logic helpers (no server-only deps).
  *
  * After the V3 cutover, this file holds only the shared utilities that
  * the V3 interpreter (lib/agent-core-v3.ts) and the rest of the agent

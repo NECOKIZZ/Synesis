@@ -32,7 +32,7 @@ const PATTERNS: Pattern[] = [
   { match: /invalid.*one[- ]?time.*password/i,  replace: "That code is wrong or expired. Try requesting a new one." },
   { match: /token.*expired|otp.*expired|expired token/i, replace: "Your code expired. Request a fresh one." },
   { match: /email.*not.*confirmed/i,            replace: "Please confirm your email first — check your inbox." },
-  { match: /rate ?limit|too many requests|429/i,replace: "Too many tries — please wait a minute and try again." },
+  { match: /rate ?limit|too many requests|(?:HTTP|status(?:\s*code)?)\s*429/i,replace: "Too many tries — please wait a minute and try again." },
   { match: /user.*not.*found|no.*user.*found/i, replace: "We couldn't find an account for that email." },
   { match: /bad_oauth_state|oauth state/i,      replace: "Sign-in timed out. Close any extra tabs and try again." },
   // PKCE verifier in storage went missing — typical causes: started flow in
@@ -67,7 +67,7 @@ const PATTERNS: Pattern[] = [
   { match: /self[- ]?send|cannot.*send.*to.*self/i, replace: "You can't send to your own wallet." },
 
   // ── Agent / LLM ────────────────────────────────────────────────────
-  { match: /AI interpretation failed|OPENROUTER_API_KEY/i, replace: "The assistant is offline right now. Please try again in a moment." },
+  { match: /AI interpretation failed|OPENROUTER_API_KEY/i, replace: "Hey buddy, feeling a bit sick right now — I'll get back to you once I recover. Try again in a moment." },
   { match: /openrouter|anthropic|llm|language model|model.*returned/i, replace: "I'm having trouble understanding that. Try rephrasing it." },
   { match: /could not interpret|cannot interpret|unknown.*instruction/i, replace: "I couldn't understand that instruction. Try rephrasing it." },
   { match: /agent.*not.*activated|activate.*agent.*first|agent.*not.*found/i, replace: "Activate your Smart Agent before using this feature." },
@@ -110,10 +110,13 @@ const PATTERNS: Pattern[] = [
   { match: /aborted|cancel/i,                   replace: "Cancelled." },
 
   // ── HTTP status codes (only when nothing more specific hit) ────────
-  { match: /\b401\b|unauthori[sz]ed/i,          replace: "Please sign in again." },
-  { match: /\b403\b|forbidden/i,                replace: "You don't have access to do that." },
-  { match: /\b404\b|not found/i,                replace: "We couldn't find that." },
-  { match: /\b5\d{2}\b|server error/i,          replace: "Our servers are having a moment. Please try again." },
+  // Numeric codes require an HTTP/status prefix so a bare 3-digit number in a
+  // legitimate message (e.g. "Instruction too long (max 500 chars)", "sent 550
+  // USDC") is NOT rewritten. Word alternates still catch real HTTP errors.
+  { match: /(?:HTTP|status(?:\s*code)?)\s*401\b|unauthori[sz]ed/i, replace: "Please sign in again." },
+  { match: /(?:HTTP|status(?:\s*code)?)\s*403\b|forbidden/i,       replace: "You don't have access to do that." },
+  { match: /(?:HTTP|status(?:\s*code)?)\s*404\b|not found/i,       replace: "We couldn't find that." },
+  { match: /(?:HTTP|status(?:\s*code)?)\s*5\d{2}\b|server error/i, replace: "Our servers are having a moment. Please try again." },
 ];
 
 const DEFAULT_FALLBACK = "Something went wrong. Please try again.";
@@ -148,7 +151,7 @@ const APP_ERROR_COPY: Record<ErrorCode, string> = {
   // Agent
   AGENT_NOT_ACTIVATED: "Activate your Smart Agent before using this feature.",
   AGENT_LIMIT_EXCEEDED: "This would exceed your spending limit. Adjust the amount or update your limits.",
-  AGENT_INTERPRET_FAILED: "The assistant is offline right now. Please try again in a moment.",
+  AGENT_INTERPRET_FAILED: "Hey buddy, feeling a bit sick right now — I'll get back to you once I recover. Try again in a moment.",
   AGENT_UNDERSTANDING: "I couldn't understand that instruction. Try rephrasing it.",
   POLICY_NOT_FOUND: "That automation no longer exists. Refresh and try again.",
 

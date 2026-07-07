@@ -1,15 +1,15 @@
 /**
  * About — placeholder marketing page.
  *
- * Replaces the wallet-shell-style copy with a simple intro to DotArc.
+ * Replaces the wallet-shell-style copy with a simple intro to Synesis.
  * Visual language matches the landing hero (light backdrop + Clash Display).
  */
 
 import Link from "next/link";
 
 export const metadata = {
-  title: "About — DotArc",
-  description: "DotArc is your name on the chain. Programmable USDC payments built on Arc Network.",
+  title: "About — Synesis",
+  description: "Synesis is your name on the chain. Programmable USDC payments built on Arc Network.",
 };
 
 export default function AboutPage() {
@@ -66,7 +66,7 @@ export default function AboutPage() {
             marginBottom: "20px",
           }}
         >
-          DotArc turns your name into your wallet. No seed phrases, no 0x
+          Synesis turns your name into your wallet. No seed phrases, no 0x
           addresses to memorize — just a human-readable handle on the Arc
           Network where USDC is native gas and finality is sub-second.
         </p>
