@@ -25,7 +25,7 @@ import { formatRetrieveTransactions } from "@/lib/format-transactions";
 import { useSessionEndSummary } from "@/lib/memory/use-session-end-summary";
 import { MicButton } from "@/components/voice/MicButton";
 import { SpeakButton } from "@/components/voice/SpeakButton";
-import type { InterpretResult, Task, Trigger, PlanStep } from "@/lib/agent-types";
+import type { InterpretResult, Task, Trigger } from "@/lib/agent-types";
 import {
   Home as HomeIcon,
   Activity as ActivityIcon,

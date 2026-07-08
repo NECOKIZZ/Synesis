@@ -66,7 +66,6 @@ export const GetPrice: SkillHandler = {
       if (err instanceof UnknownSymbolError) {
         return { ok: false, error: err.message, status: 400 };
       }
-      const msg = err instanceof Error ? err.message : String(err);
       // No cached value AND CoinGecko down → surface a friendly error
       // rather than a stale or invented number.
       return {

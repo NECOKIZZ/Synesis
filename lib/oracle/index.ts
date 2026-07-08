@@ -29,7 +29,6 @@
 import "server-only";
 import {
   fetchCoinGeckoPricesUSD,
-  symbolToCoinGeckoId,
   UnknownSymbolError,
   SYMBOL_TO_COINGECKO_ID,
 } from "./coingecko";
