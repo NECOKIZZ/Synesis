@@ -86,8 +86,22 @@ export type Trigger =
   | { type: "now" }
   | {
       type: "time";
-      /** "daily" | "weekly" | "monthly" — same vocabulary the cron understands */
-      schedule: "daily" | "weekly" | "monthly";
+      /**
+       * WHEN a time task fires. Beyond the legacy daily/weekly/monthly
+       * recurrences: `once` fires a single time at `at`; `hourly` fires
+       * every hour at `time_of_day`'s minute; `interval` fires every
+       * `every_minutes` minutes. Recurring fire times default to 09:00 UTC
+       * when `time_of_day` is omitted (preserves legacy behavior).
+       */
+      schedule: "once" | "hourly" | "daily" | "weekly" | "monthly" | "interval";
+      /** ISO datetime — REQUIRED for `once`. Bare (no Z/offset) → interpreted in `tz`. */
+      at?: string;
+      /** "HH:MM" 24h — fire time for hourly (minute) / daily / weekly / monthly. */
+      time_of_day?: string;
+      /** REQUIRED for `interval` — fire every N minutes. */
+      every_minutes?: number;
+      /** IANA timezone (e.g. "Africa/Lagos"). Omitted → times are UTC. */
+      tz?: string;
       /** Optional refinements; semantics match the old recurring task. */
       day_of_week?: number;          // 0=Sun..6=Sat
       day_of_month?: number;         // 1-31
@@ -170,5 +184,18 @@ export type InterpretResult = {
    * Absent → treat as false (fail-safe: show the card).
    */
   auto_confirm?: boolean;
+  /**
+   * INTERNAL / logs-only — the model's short explanation of WHY it chose
+   * these tasks (triggers, skills, amounts). Populated by the interpreter,
+   * logged server-side for prompt tuning, and STRIPPED before the response
+   * reaches the client. Never shown to the user.
+   */
+  reasoning?: string;
+  /**
+   * INTERNAL / logs-only — the specific context inputs the model relied on
+   * (e.g. "balance=42 USDC", "memory: sara=sara.arc", "prior turn"). Same
+   * lifecycle as `reasoning`: logged, then stripped from the client response.
+   */
+  citations?: string[];
 };
 

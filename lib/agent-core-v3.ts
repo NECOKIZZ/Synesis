@@ -32,6 +32,7 @@ import type {
 import { getLivePrices, type LivePrices } from "@/lib/agent-core";
 import { renderSkillCatalog, getActiveCatalog, type SkillCatalogEntry } from "@/lib/skills/catalog";
 import { withResilience } from "@/lib/resilience";
+import { VALID_SCHEDULES, isValidTimeOfDay, parseAt } from "@/lib/schedule";
 
 // ── Validation primitives ───────────────────────────────────────────────
 
@@ -47,7 +48,8 @@ const VALID_LEAF_SKILLS = new Set<SkillName>(
   getActiveCatalog().map((e) => e.skill_name),
 );
 
-const VALID_SCHEDULES = new Set(["daily", "weekly", "monthly"]);
+// VALID_SCHEDULES is imported from lib/schedule (single source of truth for
+// the schedule vocabulary shared with create-policy + the cron runner).
 const VALID_PRICE_ASSETS = new Set(["BTC", "ETH", "USDC", "EURC", "cirBTC"]);
 const VALID_PRICE_DIRECTIONS = new Set(["above", "below"]);
 const VALID_MODES = new Set(["once", "repeat"]);
@@ -124,11 +126,21 @@ export function buildSystemPromptV3(context: {
    * and the round-trip (router on → off → on) is lossless.
    */
   skillsToInject?: SkillCatalogEntry[];
+  /**
+   * The user's IANA timezone (e.g. "Africa/Lagos") when the client can
+   * supply it. When present, scheduled wall-clock times are interpreted in
+   * this zone; when omitted, all times are UTC (the cross-platform default).
+   */
+  timezone?: string;
 }): string {
   const now = new Date();
   const todayUtc = now.toISOString().slice(0, 10);
   const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
   const todayLabel = `${dayNames[now.getUTCDay()]} ${todayUtc}`;
+  // Current UTC wall-clock (HH:MM) so the model can resolve relative times
+  // like "in 2 hours" / "later today" and pick a correct `at` for `once`.
+  const nowUtcTime = now.toISOString().slice(11, 16);
+  const tz = context.timezone && context.timezone.trim() !== "" ? context.timezone.trim() : undefined;
   const prices = context.livePrices ?? { eurcUsdc: 1.08, cirBtcUsdc: 100_000 };
 
   // V3.5 Track 3 — identity line. Only rendered when the caller supplied a
@@ -300,6 +312,9 @@ HARD RULES — never break these:
 - For ANY actual wallet action, always use the \`tasks\` array.
 
 Current UTC date: ${todayLabel} (day ${now.getUTCDate()} of the month)
+Current UTC time: ${nowUtcTime} (24h). ${tz
+  ? `The user's timezone is ${tz}; interpret their clock times in that zone.`
+  : `No user timezone is known — interpret ALL clock times as UTC and say "UTC" in every confirmation_message.`}
 User's agent wallet balances:
 ${context.allBalances && context.allBalances.length > 0
   ? context.allBalances.map(b => `  - ${b.symbol}: ${b.amount} (~$${b.approxUsdValue.toFixed(2)})`).join("\n")
@@ -337,11 +352,25 @@ Return ONE JSON object with EXACTLY this top-level shape:
 
 {
   "tasks": [ Task, Task, ... ],
-  "combined_confirmation_message": "one-line summary of everything"
+  "combined_confirmation_message": "one-line summary of everything",
+  "reasoning": "1-3 sentences: WHY you chose these triggers/skills/amounts",
+  "citations": ["the specific inputs you relied on"]
 }
 
 \`tasks\` is ALWAYS an array, even if the user message produces a single
 task. NEVER return a bare task object at the top level.
+
+\`reasoning\` and \`citations\` are INTERNAL diagnostics for the operators —
+never shown to the user. ALWAYS include them:
+  - \`reasoning\`: a brief, honest explanation of your decision — why this
+    trigger/schedule, why this skill, how you resolved the amount/recipient,
+    any assumption you made (e.g. "defaulted time to UTC", "used memory to
+    resolve 'sara' → sara.arc"). Do NOT address the user here; write it for
+    an engineer reading logs.
+  - \`citations\`: the concrete context inputs that drove the decision, each a
+    short string — e.g. "balance: 42 USDC", "memory: sara=sara.arc",
+    "prior turn: 'make it 20'", "active policy #abc", "live price BTC=…".
+    Use [] only when nothing beyond the raw message was used.
 
 A Task is:
 {
@@ -362,11 +391,25 @@ TRIGGER VOCABULARY
 A) Immediate
    { "type": "now" }
 
-B) Time-scheduled
-   { "type": "time", "schedule": "daily" | "weekly" | "monthly",
-     "day_of_week"?: 0-6,         // 0=Sun..6=Sat, for weekly
+B) Time-scheduled — fires at a clock time you choose (NOT always 9am)
+   { "type": "time", "schedule": "once"|"hourly"|"daily"|"weekly"|"monthly"|"interval",
+     "at"?: "YYYY-MM-DDTHH:MM",    // REQUIRED for "once" — a single specific datetime
+     "time_of_day"?: "HH:MM",      // 24h fire time for hourly(minute)/daily/weekly/monthly
+     "every_minutes"?: number,     // REQUIRED for "interval" — fire every N minutes
+     "day_of_week"?: 0-6,          // 0=Sun..6=Sat, for weekly
      "day_of_month"?: 1-31,        // for monthly
      "last_day_of_month"?: true }  // for monthly end-of-month
+
+   Choosing a schedule:
+   - "once"     → a one-time action at a specific date+time ("at 3pm today",
+                  "tomorrow at 18:00", "on Aug 5 at noon"). Set "at" and use
+                  execution_mode "once".
+   - "interval" → every N minutes ("every 15 minutes", "every 2 hours" → 120).
+   - "hourly"   → every hour (optionally at a set minute via time_of_day).
+   - "daily"/"weekly"/"monthly" → recurring at "time_of_day" (defaults to 09:00
+                  if you omit it — but if the user names a time, SET time_of_day).
+   TIME ZONE: ${tz ? `times are in ${tz}.` : `NO timezone is known, so ALL times are UTC. You MUST write the time and the word "UTC" into every confirmation_message (e.g. "every day at 14:30 UTC").`}
+   Never silently default a user-specified time to 9am.
 
 C) Price-triggered
    { "type": "price", "asset": "BTC"|"ETH"|"USDC"|"EURC"|"cirBTC",
@@ -491,15 +534,15 @@ MORE WORKED EXAMPLES
   }],
   "combined_confirmation_message": "Swap ~8.5 USDC → EURC, then send 10 EURC to maya.arc" }
 
-3) "pay sara 5 USDC every week starting Monday"
+3) "pay sara 5 USDC every Monday at 5pm"
 { "tasks": [{
-    "trigger": { "type": "time", "schedule": "weekly", "day_of_week": 1 },
+    "trigger": { "type": "time", "schedule": "weekly", "day_of_week": 1, "time_of_day": "17:00" },
     "steps":   [{ "skill": "SEND_USDC", "params": { "recipient": "sara.arc", "amount": 5 },
                   "description": "Send 5 USDC to sara.arc" }],
     "execution_mode": "repeat",
-    "confirmation_message": "Every Monday, send 5 USDC to sara.arc"
+    "confirmation_message": "Every Monday at 17:00 UTC, send 5 USDC to sara.arc"
   }],
-  "combined_confirmation_message": "Every Monday, send 5 USDC to sara.arc" }
+  "combined_confirmation_message": "Every Monday at 17:00 UTC, send 5 USDC to sara.arc" }
 
 4) "buy BTC once price drops below 80000"
 { "tasks": [{
@@ -523,6 +566,36 @@ MORE WORKED EXAMPLES
     "confirmation_message": "Check the current price of BTC"
   }],
   "combined_confirmation_message": "Check the current price of BTC" }
+
+7) "send maya 10 today at 3pm"  (one-off at a specific time — NOT recurring)
+{ "tasks": [{
+    "trigger": { "type": "time", "schedule": "once", "at": "${todayUtc}T15:00" },
+    "steps":   [{ "skill": "SEND_USDC", "params": { "recipient": "maya.arc", "amount": 10 },
+                  "description": "Send 10 USDC to maya.arc" }],
+    "execution_mode": "once",
+    "confirmation_message": "Today at 15:00 UTC, send 10 USDC to maya.arc (one time)"
+  }],
+  "combined_confirmation_message": "Today at 15:00 UTC, send 10 USDC to maya.arc" }
+
+8) "move 2 USDC to sara every 15 minutes"  (interval)
+{ "tasks": [{
+    "trigger": { "type": "time", "schedule": "interval", "every_minutes": 15 },
+    "steps":   [{ "skill": "SEND_USDC", "params": { "recipient": "sara.arc", "amount": 2 },
+                  "description": "Send 2 USDC to sara.arc" }],
+    "execution_mode": "repeat",
+    "confirmation_message": "Every 15 minutes, send 2 USDC to sara.arc"
+  }],
+  "combined_confirmation_message": "Every 15 minutes, send 2 USDC to sara.arc" }
+
+9) "pay my rent — 500 to landlord.arc on the 1st of every month at 08:00"
+{ "tasks": [{
+    "trigger": { "type": "time", "schedule": "monthly", "day_of_month": 1, "time_of_day": "08:00" },
+    "steps":   [{ "skill": "SEND_USDC", "params": { "recipient": "landlord.arc", "amount": 500 },
+                  "description": "Send 500 USDC to landlord.arc" }],
+    "execution_mode": "repeat",
+    "confirmation_message": "On the 1st of every month at 08:00 UTC, send 500 USDC to landlord.arc"
+  }],
+  "combined_confirmation_message": "On the 1st of every month at 08:00 UTC, send 500 USDC to landlord.arc" }
 
 ══════════════════════════════════════════════════════════════════════
 HARD RULES
@@ -556,12 +629,40 @@ function validateTrigger(raw: unknown, path: string): Trigger {
   if (type === "time") {
     const schedule = String(t.schedule ?? "");
     if (!VALID_SCHEDULES.has(schedule)) {
-      throw new Error(`${path}: time.schedule must be daily|weekly|monthly, got ${schedule}`);
+      throw new Error(
+        `${path}: time.schedule must be once|hourly|daily|weekly|monthly|interval, got ${schedule}`,
+      );
     }
     const out: Trigger = {
       type: "time",
-      schedule: schedule as "daily" | "weekly" | "monthly",
+      schedule: schedule as "once" | "hourly" | "daily" | "weekly" | "monthly" | "interval",
     };
+
+    // `once` REQUIRES a parseable `at` datetime.
+    if (schedule === "once") {
+      if (typeof t.at !== "string" || !parseAt(t.at, typeof t.tz === "string" ? t.tz : undefined)) {
+        throw new Error(`${path}: time.schedule="once" requires a valid ISO 'at' datetime`);
+      }
+      out.at = t.at;
+    }
+
+    // `interval` REQUIRES a positive every_minutes.
+    if (schedule === "interval") {
+      const mins = Number(t.every_minutes);
+      if (!Number.isFinite(mins) || mins <= 0) {
+        throw new Error(`${path}: time.schedule="interval" requires positive 'every_minutes'`);
+      }
+      out.every_minutes = mins;
+    }
+
+    // Optional refinements (validated when present).
+    if (t.time_of_day !== undefined) {
+      if (!isValidTimeOfDay(t.time_of_day)) {
+        throw new Error(`${path}: time.time_of_day must be "HH:MM" 24h, got ${String(t.time_of_day)}`);
+      }
+      out.time_of_day = String(t.time_of_day);
+    }
+    if (typeof t.tz === "string" && t.tz.trim() !== "") out.tz = t.tz.trim();
     if (typeof t.day_of_week === "number") out.day_of_week = t.day_of_week;
     if (typeof t.day_of_month === "number") out.day_of_month = t.day_of_month;
     if (t.last_day_of_month === true) out.last_day_of_month = true;
@@ -692,6 +793,14 @@ export function validateInterpretResult(raw: unknown): InterpretResult {
 
   const tasks = rawTasks.map((t, i) => validateTask(t, `tasks[${i}]`));
 
+  // Logs-only diagnostics — captured here, logged by the caller, and stripped
+  // from the client response in the interpret route. Best-effort: malformed
+  // reasoning/citations never fail interpretation.
+  const reasoning = typeof r.reasoning === "string" && r.reasoning.trim() !== "" ? r.reasoning.trim() : undefined;
+  const citations = Array.isArray(r.citations)
+    ? r.citations.filter((c): c is string => typeof c === "string" && c.trim() !== "").map((c) => c.trim())
+    : undefined;
+
   return {
     tasks,
     combined_confirmation_message:
@@ -699,6 +808,8 @@ export function validateInterpretResult(raw: unknown): InterpretResult {
         ? r.combined_confirmation_message
         : tasks[0]?.confirmation_message ?? "Confirm these actions",
     unknown_reason: unknownReason,
+    reasoning,
+    citations: citations && citations.length > 0 ? citations : undefined,
   };
 }
 
@@ -729,6 +840,8 @@ export async function interpretInstructionV3(args: {
     userArcName?: string;
     /** V3.5 Track 4 — router-selected skills. Undefined → hardcoded catalog. */
     skillsToInject?: SkillCatalogEntry[];
+    /** User's IANA timezone for scheduling. Undefined → times are UTC. */
+    timezone?: string;
   };
   /**
    * Layer A — in-session conversation history (oldest → newest), already
@@ -874,7 +987,16 @@ export async function interpretInstructionV3(args: {
   }
 
   try {
-    return validateInterpretResult(parsed);
+    const validated = validateInterpretResult(parsed);
+    // Logs-only reasoning block — the model's own explanation of WHY it chose
+    // these tasks, plus the context inputs it cited. Printed here (server-side)
+    // for prompt tuning; the interpret route strips both fields before the
+    // response reaches the client.
+    console.log("\n=== LLM REASONING (V3) ===");
+    console.log("[REASONING]", validated.reasoning ?? "(none provided)");
+    console.log("[CITATIONS]", validated.citations?.length ? validated.citations.join(" | ") : "(none)");
+    console.log("==========================\n");
+    return validated;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error("[agent/interpret v3] Validation error:", msg, "| Parsed:", JSON.stringify(parsed).slice(0, 500));

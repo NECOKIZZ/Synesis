@@ -39,6 +39,7 @@ import { skillRegistry } from "@/lib/skills";
 import type { AgentPolicy, SkillContext } from "@/lib/skills/types";
 import { logSkillExecution } from "@/lib/agent-audit";
 import { isAddress } from "ethers";
+import { computeNextRun } from "@/lib/schedule";
 
 export const runtime = "nodejs";
 
@@ -215,6 +216,12 @@ async function runPolicy(
           .from("agent_policies")
           .update({ next_run: nextRun })
           .eq("id", policy.id);
+      } else {
+        // No future slot (e.g. a `once` time sub-trigger inside an `and` whose
+        // window elapsed before the other conditions were met). Deactivate so
+        // we don't busy-poll a dead schedule every tick.
+        await deactivate(serviceSupabase, policy.id, "Scheduled window passed before all conditions were met");
+        return { policyId: policy.id, action: actionLabel, ok: true, pauseReason: "Scheduled window passed" };
       }
     }
     return { policyId: policy.id, action: actionLabel, ok: true, error: triggerFired.reason };
@@ -277,6 +284,22 @@ async function runPolicy(
   if (claimed !== true) {
     return { policyId: policy.id, action: actionLabel, ok: true, error: "Already claimed this cycle (idempotent skip)" };
   }
+
+  // Transparency for autonomous fires: one line explaining WHY money is about
+  // to move on this tick (complements the interpret-time reasoning logs). The
+  // schedule value lives in trigger_params.frequency (time) or the time
+  // sub-condition (and); price/balance triggers report their type.
+  const firedSchedule =
+    (policy.trigger_params?.frequency as string | undefined) ??
+    (policy.trigger_type === "and"
+      ? (Array.isArray(policy.trigger_params?.conditions)
+          ? ((policy.trigger_params!.conditions as Array<{ type: string; frequency?: string; schedule?: string }>)
+              .find((c) => c.type === "time")?.schedule ?? "composite")
+          : "composite")
+      : policy.trigger_type);
+  console.log(
+    `[cron] policy ${policy.id} FIRED reason=${policy.trigger_type}/${firedSchedule} scheduled_for=${scheduledFor} action=${actionLabel}`,
+  );
 
   // ── Compound execution (multi-step) ─────────────────────────────
   if (isCompound && stepsForExec && stepsForExec.length > 0) {
@@ -638,11 +661,27 @@ async function advancePolicyState(
  * component), returns null and the cron just polls every tick.
  */
 function computeNextRunForPolicy(policy: AgentPolicy): string | null {
+  // `frequency` is the legacy trigger_params key that holds the schedule value
+  // (once|hourly|daily|weekly|monthly|interval). All schedule math is delegated
+  // to lib/schedule so create-policy and the cron never drift.
+  const nextRunFrom = (src: Record<string, unknown> | undefined): string | null => {
+    const schedule = String(src?.frequency ?? src?.schedule ?? "");
+    if (!schedule) return null;
+    return computeNextRun({
+      schedule,
+      at: src?.at as string | undefined,
+      time_of_day: src?.time_of_day as string | undefined,
+      every_minutes: src?.every_minutes as number | undefined,
+      tz: src?.tz as string | undefined,
+      day_of_week: src?.day_of_week as number | undefined,
+      day_of_month: src?.day_of_month as number | undefined,
+      last_day_of_month: src?.last_day_of_month as boolean | undefined,
+      from: new Date(),
+    });
+  };
+
   if (policy.trigger_type === "time") {
-    const freq = policy.trigger_params?.frequency as string | undefined;
-    const dow = policy.trigger_params?.day_of_week as number | undefined;
-    const dom = policy.trigger_params?.day_of_month as number | undefined;
-    return freq ? computeNextRunTime(freq, dow, dom) : null;
+    return nextRunFrom(policy.trigger_params);
   }
   if (policy.trigger_type === "and") {
     const conditions = Array.isArray(policy.trigger_params?.conditions)
@@ -650,11 +689,7 @@ function computeNextRunForPolicy(policy: AgentPolicy): string | null {
       : [];
     const timeSub = conditions.find((c) => c.type === "time");
     if (!timeSub) return null;
-    return computeNextRunTime(
-      timeSub.schedule as string,
-      timeSub.day_of_week as number | undefined,
-      timeSub.day_of_month as number | undefined,
-    );
+    return nextRunFrom(timeSub as Record<string, unknown>);
   }
   return null;
 }
@@ -742,37 +777,6 @@ function sumStepAmountsUsdc(
     return total + extractAmountFromParams(s.params);
   }, 0);
 }
-
-function computeNextRunTime(
-  frequency: string,
-  dayOfWeek?: number,
-  dayOfMonth?: number,
-): string | null {
-  const now = new Date();
-  const next = new Date(now);
-
-  if (frequency === "daily") {
-    next.setUTCDate(next.getUTCDate() + 1);
-    next.setUTCHours(9, 0, 0, 0);
-  } else if (frequency === "weekly") {
-    const targetDow = dayOfWeek ?? 1;
-    const daysUntil = (targetDow - next.getUTCDay() + 7) % 7;
-    next.setUTCDate(next.getUTCDate() + (daysUntil === 0 ? 7 : daysUntil));
-    next.setUTCHours(9, 0, 0, 0);
-  } else if (frequency === "monthly") {
-    const targetDom = dayOfMonth ?? 1;
-    next.setUTCDate(1);
-    next.setUTCMonth(next.getUTCMonth() + 1);
-    next.setUTCDate(targetDom);
-    next.setUTCHours(9, 0, 0, 0);
-  } else {
-    return null;
-  }
-
-  if (next <= now) {
-    if (frequency === "daily") next.setUTCDate(next.getUTCDate() + 1);
-    else if (frequency === "weekly") next.setUTCDate(next.getUTCDate() + 7);
-    else if (frequency === "monthly") next.setUTCMonth(next.getUTCMonth() + 1);
-  }
-  return next.toISOString();
-}
+// Schedule/next-run math lives in lib/schedule (computeNextRun), shared with
+// create-policy so the two never drift. The old local copy (hard-coded to
+// 09:00 UTC, daily/weekly/monthly only) was removed.

@@ -1256,7 +1256,13 @@ function AgentTab({ arcName }: { arcName: string | null }) {
     const res = await fetch("/api/agent/interpret", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ instruction, history }),
+      body: JSON.stringify({
+        instruction,
+        history,
+        // Local timezone so "at 3pm" schedules resolve to the user's clock.
+        // Falls back to UTC server-side when unavailable (non-browser clients).
+        timezone: typeof Intl !== "undefined" ? Intl.DateTimeFormat().resolvedOptions().timeZone : undefined,
+      }),
     });
     setInterpreting(false);
     if (!res.ok) {

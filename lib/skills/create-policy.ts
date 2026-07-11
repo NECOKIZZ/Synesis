@@ -42,6 +42,7 @@ import { signPolicyHmac, getAgentBalance } from "@/lib/agent";
 import type { SkillHandler, SkillContext, SkillOutput } from "./types";
 import { skillRegistry } from "./index";
 import type { Task, Trigger, PlanStep } from "@/lib/agent-types";
+import { computeNextRun, parseAt } from "@/lib/schedule";
 
 // ── Validation primitives ───────────────────────────────────────────────
 
@@ -100,61 +101,6 @@ function isValidStopCondition(sc: unknown): boolean {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
-
-/**
- * Last calendar day of `month` (UTC), at 09:00 UTC. Used for
- * "last day of month" recurring schedules. `month` is 0-indexed.
- */
-function lastDayOfMonth(year: number, month: number): Date {
-  return new Date(Date.UTC(year, month + 1, 0, 9, 0, 0, 0));
-}
-
-/** Clamp day_of_month to the actual last day of the given UTC month. */
-function clampDom(year: number, month: number, dom: number): Date {
-  const lastDay = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
-  return new Date(Date.UTC(year, month, Math.min(dom, lastDay), 9, 0, 0, 0));
-}
-
-/**
- * Compute the next UTC fire time for a time-based trigger. Returns ISO
- * string or null if frequency is unrecognised (caller should reject).
- */
-function computeNextRunTime(
-  frequency: string,
-  dayOfWeek?: number,
-  dayOfMonth?: number,
-  lastDayOfMonthFlag?: boolean,
-): string | null {
-  const now = new Date();
-
-  if (frequency === "daily") {
-    const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 9, 0, 0, 0));
-    return next.toISOString();
-  }
-
-  if (frequency === "weekly") {
-    const targetDow = dayOfWeek ?? 1; // default Monday
-    const daysUntil = (targetDow - now.getUTCDay() + 7) % 7 || 7;
-    const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + daysUntil, 9, 0, 0, 0));
-    return next.toISOString();
-  }
-
-  if (frequency === "monthly") {
-    const y = now.getUTCFullYear();
-    const m = now.getUTCMonth();
-    if (lastDayOfMonthFlag) {
-      const thisLast = lastDayOfMonth(y, m);
-      if (thisLast > now) return thisLast.toISOString();
-      return lastDayOfMonth(y, m + 1).toISOString();
-    }
-    const targetDom = dayOfMonth ?? 1;
-    const candidate = clampDom(y, m, targetDom);
-    if (candidate > now) return candidate.toISOString();
-    return clampDom(y, m + 1, targetDom).toISOString();
-  }
-
-  return null;
-}
 
 /**
  * Pull the embedded "time" sub-trigger out of a composite ("and") trigger
@@ -245,7 +191,13 @@ function validateTriggerForPersistence(trigger: Trigger): {
   }
 
   if (trigger.type === "time") {
+    // `frequency` is the legacy key the cron already reads; it now holds any
+    // of the six schedules (once|hourly|daily|weekly|monthly|interval).
     const params: Record<string, unknown> = { frequency: trigger.schedule };
+    if (typeof trigger.at === "string") params.at = trigger.at;
+    if (typeof trigger.time_of_day === "string") params.time_of_day = trigger.time_of_day;
+    if (typeof trigger.every_minutes === "number") params.every_minutes = trigger.every_minutes;
+    if (typeof trigger.tz === "string") params.tz = trigger.tz;
     if (typeof trigger.day_of_week === "number") params.day_of_week = trigger.day_of_week;
     if (typeof trigger.day_of_month === "number") params.day_of_month = trigger.day_of_month;
     if (trigger.last_day_of_month) params.last_day_of_month = true;
@@ -348,6 +300,32 @@ export const CreatePolicy: SkillHandler = {
       return { ok: false, error: msg, status: 400 };
     }
 
+    // ── 2b. `once` guardrails ────────────────────────────────────────
+    // A one-off scheduled action must not repeat, and its target time must
+    // still be in the future (a "3pm today" the model resolved a minute too
+    // late shouldn't silently create a dead policy).
+    const onceTimeSub = findTimeSubTrigger(task.trigger);
+    if (onceTimeSub && onceTimeSub.schedule === "once") {
+      if (task.execution_mode !== "once") {
+        return {
+          ok: false,
+          error: "A one-time (`once`) schedule can't repeat — set execution_mode to 'once'.",
+          status: 400,
+        };
+      }
+      const at = parseAt(onceTimeSub.at, onceTimeSub.tz);
+      if (!at) {
+        return { ok: false, error: "The scheduled time is missing or invalid.", status: 400 };
+      }
+      if (at.getTime() <= Date.now()) {
+        return {
+          ok: false,
+          error: "That time has already passed — please pick a time in the future.",
+          status: 400,
+        };
+      }
+    }
+
     // ── 3. Validate each step's skill, then run skill-level validators
     const normalizedSteps: PlanStep[] = [];
     for (let i = 0; i < task.steps.length; i++) {
@@ -431,12 +409,16 @@ export const CreatePolicy: SkillHandler = {
     let nextRun: string | null = null;
     const timeSub = findTimeSubTrigger(task.trigger);
     if (timeSub) {
-      nextRun = computeNextRunTime(
-        timeSub.schedule,
-        timeSub.day_of_week,
-        timeSub.day_of_month,
-        timeSub.last_day_of_month,
-      );
+      nextRun = computeNextRun({
+        schedule: timeSub.schedule,
+        at: timeSub.at,
+        time_of_day: timeSub.time_of_day,
+        every_minutes: timeSub.every_minutes,
+        tz: timeSub.tz,
+        day_of_week: timeSub.day_of_week,
+        day_of_month: timeSub.day_of_month,
+        last_day_of_month: timeSub.last_day_of_month,
+      });
     }
 
     // ── 8. Decide compound vs simple persistence shape ───────────────

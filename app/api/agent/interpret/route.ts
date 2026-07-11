@@ -58,6 +58,25 @@ function sanitizeHistory(raw: unknown): ChatTurn[] {
   return out.slice(-HISTORY_MAX_TURNS);
 }
 
+/**
+ * Validate a client-supplied IANA timezone (e.g. "Africa/Lagos"). Returns
+ * undefined for anything missing or not recognised by the runtime — the
+ * interpreter then falls back to UTC (the cross-platform default). We verify
+ * against Intl so a junk string can't reach the schedule math.
+ */
+function sanitizeTimezone(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const tz = raw.trim();
+  if (!tz || tz.length > 64) return undefined;
+  try {
+    // Throws RangeError for an unknown/invalid identifier.
+    new Intl.DateTimeFormat("en-US", { timeZone: tz });
+    return tz;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function POST(req: Request) {
   const traceId = crypto.randomUUID();
 
@@ -85,10 +104,12 @@ export async function POST(req: Request) {
   // ── Body ──────────────────────────────────────────────────────────
   let instruction: string;
   let history: ChatTurn[] = [];
+  let timezone: string | undefined;
   try {
     const body = await req.json();
     instruction = String(body.instruction ?? "").trim();
     history = sanitizeHistory(body.history);
+    timezone = sanitizeTimezone(body.timezone);
   } catch {
     return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
   }
@@ -421,10 +442,17 @@ export async function POST(req: Request) {
         userProfile,
         skillsToInject,
         livePrices,
+        timezone,
       },
     });
     console.log(
-      `[agent/interpret] trace=${traceId} tasks=${result.tasks.length} triggers=${result.tasks.map((t) => t.trigger.type).join(",") || "none"} unknown=${result.unknown_reason ? "yes" : "no"}`,
+      `[agent/interpret] trace=${traceId} tasks=${result.tasks.length} triggers=${result.tasks.map((t) => t.trigger.type).join(",") || "none"} unknown=${result.unknown_reason ? "yes" : "no"} tz=${timezone ?? "UTC"}`,
+    );
+    // Logs-only troubleshooting block: the model's own reasoning + the context
+    // it cited, correlated by traceId. Stripped from the client response below.
+    console.log(
+      `[agent/interpret] trace=${traceId} [reasoning] ${result.reasoning ?? "(none)"}` +
+        (result.citations?.length ? `\n[agent/interpret] trace=${traceId} [citations] ${result.citations.join(" | ")}` : ""),
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -487,8 +515,13 @@ export async function POST(req: Request) {
   //                   config, same-user withdraw/swap/self-bridge)
   const walletAddress = agentSession.session.walletAddress;
   const requiresPin = batchRequiresPin(result.tasks, walletAddress);
+  // Strip the internal-only diagnostics (reasoning + citations) — they are for
+  // server logs and must never reach the client.
+  const clientResult: InterpretResult = { ...result };
+  delete clientResult.reasoning;
+  delete clientResult.citations;
   return NextResponse.json({
-    ...result,
+    ...clientResult,
     requires_pin: requiresPin,
     upfront_usdc: totalUpfrontUsdc(result.tasks),
     auto_confirm: batchAutoConfirm(result.tasks, walletAddress),
