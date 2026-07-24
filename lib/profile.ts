@@ -121,7 +121,7 @@ export async function upsertProfileForCurrentUser(args: {
  */
 export async function setArcNameForCurrentUser(args: {
   arcName: string; // label without .arc suffix
-  arcNameTx: string;
+  arcNameTx?: string | null; // on-chain tx hash; null when registered DB-only
 }): Promise<Profile | null> {
   const supabase = await createSupabaseServerClient();
   const {
@@ -134,7 +134,7 @@ export async function setArcNameForCurrentUser(args: {
     .from("profiles")
     .update({
       arc_name: args.arcName.toLowerCase(),
-      arc_name_tx: args.arcNameTx,
+      arc_name_tx: args.arcNameTx ?? null,
     })
     .eq("id", user.id)
     .select("*")

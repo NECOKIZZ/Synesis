@@ -9,6 +9,7 @@ import "server-only";
 import { Contract, JsonRpcProvider } from "ethers";
 import { AppError } from "./errors";
 import { withResilience } from "./resilience";
+import { createSupabaseServiceClient } from "@/lib/supabase/service";
 
 const RPC_URL =
   process.env.NEXT_PUBLIC_ARC_RPC_URL || "https://rpc.testnet.arc.network";
@@ -40,7 +41,38 @@ export async function isAvailable(label: string): Promise<boolean> {
   return await registry.isAvailable(label);
 }
 
+/**
+ * DB fallback for forward resolution (name → address).
+ *
+ * `profiles.arc_name` (UNIQUE) is the SOURCE OF TRUTH while the on-chain ANS
+ * registry is unavailable — the schema was designed for exactly this ("fast-
+ * lookup wallets by name without going on-chain", 0001_profiles.sql). Uses the
+ * service-role client because RLS on `profiles` otherwise limits reads to the
+ * signed-in user's own row, and recipient resolution is inherently cross-user.
+ *
+ * `label` must already be normalized (lowercased, no `.arc` suffix) — the same
+ * form `setArcNameForCurrentUser` writes. Returns null if no user owns the
+ * label or on ANY DB/config error (never throws — callers fall back on-chain).
+ */
+export async function resolveNameViaDb(label: string): Promise<string | null> {
+  try {
+    const supabase = createSupabaseServiceClient();
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("wallet_address")
+      .eq("arc_name", label)
+      .maybeSingle();
+    if (error || !data?.wallet_address) return null;
+    return data.wallet_address as string;
+  } catch {
+    return null;
+  }
+}
+
 export async function resolveName(label: string): Promise<string | null> {
+  // DB-first: reliable + instant while on-chain ANS is unavailable.
+  const dbAddr = await resolveNameViaDb(label);
+  if (dbAddr) return dbAddr;
   try {
     const addr: string = await registry.resolve(label);
     if (!addr || addr === ZERO_ADDRESS) return null;
@@ -116,6 +148,13 @@ export async function resolveRecipient(input: string): Promise<string> {
   if (!/^[a-z0-9-]{3,32}$/.test(label)) {
     throw new AppError("RECIPIENT_NOT_FOUND", `Invalid .arc name: ${trimmed}`);
   }
+
+  // DB-FIRST resolution: profiles.arc_name is the source of truth while the
+  // on-chain ANS registry is unavailable. This is the demo-critical path
+  // (agent SEND_USDC → resolveRecipient) — a DB read is fast, reliable, and
+  // never subject to the Arc RPC flakiness that plagues the on-chain call.
+  const dbAddress = await resolveNameViaDb(label);
+  if (dbAddress) return dbAddress;
 
   // Resolve DIRECTLY (not via resolveName's catch-all→null) so a transient RPC
   // failure can be told apart from a genuine "no owner" (F-17).

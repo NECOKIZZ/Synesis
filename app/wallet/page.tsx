@@ -179,6 +179,22 @@ export default function WalletPage() {
     const fetchBalances = async () => {
       setBalanceLoading(true);
       try {
+        // Server-side read first — avoids the browser→Arc-RPC CORS/flakiness
+        // that was leaving the main wallet showing a blank/zero balance.
+        try {
+          const r = await fetch("/api/wallet/balance");
+          if (r.ok) {
+            const d = await r.json();
+            if (!cancelled && Array.isArray(d.tokenBalances) && !d.stale) {
+              setTokenBalances(d.tokenBalances as TokenBalance[]);
+              setBalance(typeof d.balanceUsdc === "string" ? d.balanceUsdc : "0");
+              return;
+            }
+          }
+        } catch {
+          // fall through to the direct client-side RPC read below
+        }
+
         const provider = new JsonRpcProvider(ARC_RPC_URL);
         const results: TokenBalance[] = [];
 

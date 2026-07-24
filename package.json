@@ -13,6 +13,7 @@
     "check:skills": "npx tsx --conditions=react-server scripts/check-skill-sync.ts",
     "seed:skills": "npx tsx --conditions=react-server --env-file=.env.local scripts/seed-skill-embeddings.ts",
     "solana:smoke": "npx tsx --conditions=react-server --env-file=.env.local scripts/solana-smoke.ts",
+    "solana:backfill": "npx tsx --conditions=react-server --env-file=.env.local scripts/backfill-solana.ts",
     "circle:generate-secret": "node scripts/generate-secret.mjs",
     "circle:register-secret": "node --env-file=.env.local scripts/register-secret.mjs",
     "circle:create-treasury": "node --env-file=.env.local scripts/create-treasury.mjs",

@@ -1,31 +1,35 @@
 import { NextResponse } from "next/server";
 import { circleConfigured, treasuryRegisterName } from "@/lib/circle";
-import { isAvailable, normalizeName, reverseLookup } from "@/lib/ans";
+import { normalizeName } from "@/lib/ans";
 import { getSession, signSession, setSessionCookie, type Session } from "@/lib/auth";
-import { setArcNameForCurrentUser } from "@/lib/profile";
+import { getMyProfile, setArcNameForCurrentUser } from "@/lib/profile";
+import { createSupabaseServiceClient } from "@/lib/supabase/service";
 import { withUserLock } from "@/lib/agent-lock";
 
 export const runtime = "nodejs";
 
+// 3–32 chars, lowercase letters / digits / hyphen. Mirrors the resolver guard
+// in lib/ans.ts. Validating up-front is what kills the old opaque 400: a short
+// or invalid label used to revert the on-chain isAvailable() call and surface
+// as a meaningless "400 Unknown error".
+const LABEL_RE = /^[a-z0-9-]{3,32}$/;
+
 /**
  * POST /api/circle/register-name
  *
- * Treasury auto-pays the 5 USDC fee. Name resolves to the authenticated
- * user's wallet address.
+ * Registers a .arc name for the authenticated user.
+ *
+ * SOURCE OF TRUTH IS THE DATABASE (profiles.arc_name), not the chain. The
+ * on-chain ANS registry is currently unreliable, so we:
+ *   1. Validate the label (clean 400 on bad input).
+ *   2. Enforce one-name-per-user + global uniqueness via the DB.
+ *   3. Persist name→address to the DB — this is what resolution reads.
+ *   4. Attempt on-chain registration BEST-EFFORT — a failure here is logged
+ *      and swallowed so it can never block signup.
  *
  * Auth: dotarc_session cookie required.
- *
- * KNOWN ISSUE (CRITIQUE §5.2): treasury currently OWNS the registered name
- * on-chain rather than the user. Tracked in DOTARC_WALLET_CRITIQUE.md.
  */
 export async function POST(req: Request) {
-  if (!circleConfigured) {
-    return NextResponse.json(
-      { error: "Circle integration not configured on this server." },
-      { status: 503 }
-    );
-  }
-
   const session = await getSession();
   if (!session) {
     return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
@@ -39,44 +43,71 @@ export async function POST(req: Request) {
     }
 
     const label = normalizeName(name);
+    if (!LABEL_RE.test(label)) {
+      return NextResponse.json(
+        {
+          error:
+            "Name must be 3–32 characters, using only lowercase letters, numbers, or hyphens.",
+        },
+        { status: 400 }
+      );
+    }
 
-    // Serialize registration per wallet. Without this, two concurrent requests
-    // for the same wallet can BOTH pass the reverseLookup guard before either
-    // confirms on-chain, and each fires treasuryRegisterName — the treasury
-    // pays the 5 USDC fee twice. Same-instance protection (see lib/agent-lock.ts
-    // caveat); mirrors the lock confirm-policy already uses for money flows.
+    // Serialize per wallet so two concurrent requests can't both pass the
+    // uniqueness guard and double-write / double-pay the treasury fee.
     return await withUserLock(session.walletAddress, async () => {
-      // Guard 1: this wallet must not already own a primary .arc name on-chain.
-      // Source of truth is the registry, not our DB or the cookie.
-      const existing = await reverseLookup(session.walletAddress);
-      if (existing) {
+      // Guard 1: one .arc name per account (DB is source of truth).
+      const profile = await getMyProfile();
+      if (profile?.arcName) {
         return NextResponse.json(
           {
-            error: `This wallet already owns ${existing}. One .arc name per wallet.`,
-            existing,
+            error: `You already own ${profile.arcName}.arc. One .arc name per account.`,
+            existing: `${profile.arcName}.arc`,
           },
           { status: 409 }
         );
       }
 
-      // Guard 2: the requested label must not be taken globally.
-      const available = await isAvailable(label);
-      if (!available) {
+      // Guard 2: the label must be globally unique. Service client bypasses RLS
+      // so we can see names owned by OTHER users.
+      const svc = createSupabaseServiceClient();
+      const { data: taken } = await svc
+        .from("profiles")
+        .select("id")
+        .eq("arc_name", label)
+        .maybeSingle();
+      if (taken) {
         return NextResponse.json({ error: `${label}.arc is already taken` }, { status: 409 });
       }
 
-      const { txHash, circleTxId } = await treasuryRegisterName(label, session.walletAddress);
-
-      // Persist the name to the profile (DB cache so we don't need on-chain
-      // reverseLookup on every page load). Non-fatal if the DB write fails —
-      // the on-chain truth has already been written.
-      try {
-        await setArcNameForCurrentUser({ arcName: label, arcNameTx: txHash });
-      } catch (err) {
-        console.error("[register-name] DB write failed (non-fatal):", err);
+      // Best-effort on-chain registration — nice-to-have provenance, but MUST
+      // NOT block signup if the Arc registry reverts or the RPC is down.
+      let txHash: string | null = null;
+      let circleTxId: string | null = null;
+      if (circleConfigured) {
+        try {
+          const res = await treasuryRegisterName(label, session.walletAddress);
+          txHash = res.txHash;
+          circleTxId = res.circleTxId;
+        } catch (err) {
+          console.error(
+            "[register-name] on-chain registration failed (non-fatal, DB is SSOT):",
+            err instanceof Error ? err.message : err
+          );
+        }
       }
 
-      // Refresh the session cookie with the new arcName
+      // Persist to the DB — THIS is what name resolution reads. If this write
+      // fails, the registration genuinely failed, so surface a 500.
+      const saved = await setArcNameForCurrentUser({ arcName: label, arcNameTx: txHash });
+      if (!saved) {
+        return NextResponse.json(
+          { error: "Could not save your name. Please try again." },
+          { status: 500 }
+        );
+      }
+
+      // Refresh the session cookie with the new arcName.
       const newSession: Session = { ...session, arcName: `${label}.arc` };
       const token = await signSession(newSession);
       await setSessionCookie(token);
@@ -87,27 +118,12 @@ export async function POST(req: Request) {
         resolvedTo: session.walletAddress,
         txHash,
         circleTxId,
-        explorerUrl: `https://testnet.arcscan.app/tx/${txHash}`,
+        onchain: Boolean(txHash),
+        explorerUrl: txHash ? `https://testnet.arcscan.app/tx/${txHash}` : null,
       });
     });
   } catch (error: unknown) {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const err = error as any;
-    const circleData = err?.response?.data;
-    const circleStatus = err?.response?.status;
-    const message = err instanceof Error ? err.message : "Unknown error";
-
-    // SECURITY: log Circle response details server-side, but never return
-    // them to the client. Circle responses can contain sensitive operational
-    // metadata that shouldn't cross the trust boundary.
-    if (circleData || circleStatus) {
-      console.error("[register-name]", { message, circleStatus });
-      return NextResponse.json(
-        { error: message },
-        { status: circleStatus || 400 }
-      );
-    }
-
+    const message = error instanceof Error ? error.message : "Unknown error";
     console.error("[register-name]", message);
     return NextResponse.json({ error: message }, { status: 400 });
   }

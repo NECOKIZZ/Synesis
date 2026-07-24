@@ -17,6 +17,7 @@ import { requireAgentSession, enforceAgentGate, createAgentWalletInCircle } from
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { treasuryRegisterName } from "@/lib/circle";
 import { isAddress } from "ethers";
+import { PublicKey } from "@solana/web3.js";
 
 export const runtime = "nodejs";
 
@@ -119,5 +120,40 @@ export async function POST(req: Request) {
     { onConflict: "user_id", ignoreDuplicates: true }
   );
 
-  return NextResponse.json({ alreadyActivated: false, agentWallet: inserted }, { status: 201 });
+  // ── Best-effort: also provision the Solana (SOL-DEVNET) agent wallet ──
+  // When SOLANA_ENABLED is on, every newly-activated user gets a Solana wallet
+  // automatically so the Solana send skill "just works" without a second manual
+  // step. Non-fatal: a failure here must NEVER break EVM activation. The address
+  // still needs devnet SOL (fees) + devnet USDC before it can send.
+  let solanaWallet: unknown = null;
+  if (process.env.SOLANA_ENABLED === "true") {
+    try {
+      const sol = await createAgentWalletInCircle("SOL-DEVNET");
+      // Validate it's a real base58 Solana pubkey (throws on an EVM 0x address).
+      // eslint-disable-next-line no-new
+      new PublicKey(sol.address);
+      const { data: solRow, error: solErr } = await supabase
+        .from("agent_wallets")
+        .insert({
+          user_id: supabaseUserId,
+          blockchain: "SOL-DEVNET",
+          circle_wallet_id: sol.walletId,
+          circle_wallet_address: sol.address,
+        })
+        .select("id, circle_wallet_id, circle_wallet_address, blockchain")
+        .single();
+      if (solErr) throw solErr;
+      solanaWallet = solRow;
+    } catch (err) {
+      console.error(
+        "[agent/activate] Solana auto-provision failed (non-fatal):",
+        err instanceof Error ? err.message : err
+      );
+    }
+  }
+
+  return NextResponse.json(
+    { alreadyActivated: false, agentWallet: inserted, solanaWallet },
+    { status: 201 }
+  );
 }
